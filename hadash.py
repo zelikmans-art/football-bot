@@ -1,15 +1,15 @@
 import time
 import os
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 
-# ========= Keys (אפשר לשים כ-ENV ב-Render, ואם לא קיים—נשתמש בקשיח) =========
+# ========= Keys (ENV on Render is recommended) =========
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "a7c81be8b4938a51d686b8ebd18c5242")
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "7846015183:AAGam93j9_FeRbUEfN6pNPLxoIbJC9fjVfc")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "6468640776")
 
 # ========= Config =========
-SCAN_INTERVAL_SEC  = 120    # every 2 minutes (24/7)
+SCAN_INTERVAL_SEC  = 120    # scan every 2 minutes (24/7)
 TIMEOUT_SEC        = 20
 
 # thresholds
@@ -18,6 +18,13 @@ SOT_THRESHOLD      = 7
 
 # de-dup alerts
 sent_alerts = set()  # "fixtureId:Team:rule"
+
+# heartbeat state
+HEARTBEAT_EVERY_SEC = 6 * 60 * 60  # 6 hours
+start_time = datetime.utcnow()
+last_heartbeat_ts = 0.0
+scan_count = 0
+last_scan_time = None
 
 # ---------- Telegram ----------
 def send_telegram(text: str):
@@ -30,6 +37,23 @@ def send_telegram(text: str):
             print("✅ Telegram sent.")
     except Exception as e:
         print("❌ Telegram exception:", e)
+
+def maybe_send_heartbeat(force: bool = False):
+    """Send a heartbeat message every 6 hours (or on demand if force=True)."""
+    global last_heartbeat_ts, scan_count, last_scan_time
+    now_ts = time.time()
+    if force or (now_ts - last_heartbeat_ts >= HEARTBEAT_EVERY_SEC):
+        uptime = datetime.utcnow() - start_time
+        uptime_str = str(uptime).split(".")[0]  # trim microseconds
+        last_scan_str = last_scan_time.strftime("%Y-%m-%d %H:%M:%S UTC") if last_scan_time else "N/A"
+        msg = (
+            "✅ Heartbeat\n"
+            f"Uptime: {uptime_str}\n"
+            f"Scans: {scan_count}\n"
+            f"Last scan: {last_scan_str}"
+        )
+        send_telegram(msg)
+        last_heartbeat_ts = now_ts
 
 # ---------- API-Football helpers ----------
 def af_headers():
@@ -56,7 +80,6 @@ def get_json_with_debug(url, kind, params=None):
     except Exception:
         print(f"❌ JSON parse error ({kind}): {r.text[:300]}")
         return None
-    # Debug fields if present
     if isinstance(js, dict):
         print("ℹ️", kind, "results:", js.get("results"), "| errors:", js.get("errors"))
     return js
@@ -95,7 +118,6 @@ def find_value(stats_list, team_name, candidates):
             if not any(c in typ for c in candidates):
                 continue
             val = row.get("value")
-            # coerce numeric
             if isinstance(val, (int, float)):
                 return float(val)
             if isinstance(val, str):
@@ -122,7 +144,11 @@ def make_key(fixture_id, team, rule):
 
 # ---------- Main scan ----------
 def scan_once():
-    print(f"🔄 Scan @ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    global scan_count, last_scan_time
+    last_scan_time = datetime.utcnow()
+    scan_count += 1
+
+    print(f"🔄 Scan @ {last_scan_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
     fixtures = get_live_fixtures()
     print(f"📊 Found {len(fixtures)} live games")
 
@@ -142,7 +168,7 @@ def scan_once():
             gh   = goals.get("home", 0) or 0
             ga   = goals.get("away", 0) or 0
 
-            # Pull stats & events (with debug printed inside)
+            # Pull stats & events
             stats  = get_fixture_stats(fixture_id)
             events = get_fixture_events(fixture_id)
 
@@ -214,10 +240,13 @@ def scan_once():
 # =================== Runner (24/7) ===================
 if __name__ == "__main__":
     print("🔑 API_FOOTBALL_KEY in use:", API_FOOTBALL_KEY[:4] + "…" + API_FOOTBALL_KEY[-4:])
-    send_telegram("✅ Bot started (API-Football stats alerts enabled, with diagnostics)")
+    send_telegram("✅ Bot started (API-Football stats alerts + 6h heartbeat)")
+    maybe_send_heartbeat(force=True)  # send startup heartbeat
+
     while True:
         try:
             scan_once()
+            maybe_send_heartbeat(force=False)  # regular heartbeat check
         except Exception as e:
             print("❌ Uncaught error in loop:", e)
             time.sleep(5)
