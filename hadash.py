@@ -12,9 +12,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "6468640776")
 SCAN_INTERVAL_SEC  = 120    # scan every 2 minutes (24/7)
 TIMEOUT_SEC        = 20
 
-# thresholds
-XG_THRESHOLD       = 1.5
-SOT_THRESHOLD      = 7
+# thresholds (UPDATED)
+XG_THRESHOLD            = 0.8
+SOT_THRESHOLD           = 3
+CORNERS_THRESHOLD       = 6
+TOTAL_SHOTS_THRESHOLD   = 8
 
 # de-dup alerts
 sent_alerts = set()  # "fixtureId:Team:rule"
@@ -44,7 +46,7 @@ def maybe_send_heartbeat(force: bool = False):
     now_ts = time.time()
     if force or (now_ts - last_heartbeat_ts >= HEARTBEAT_EVERY_SEC):
         uptime = datetime.utcnow() - start_time
-        uptime_str = str(uptime).split(".")[0]  # trim microseconds
+        uptime_str = str(uptime).split(".")[0]
         last_scan_str = last_scan_time.strftime("%Y-%m-%d %H:%M:%S UTC") if last_scan_time else "N/A"
         msg = (
             "✅ Heartbeat\n"
@@ -60,7 +62,6 @@ def af_headers():
     return {"x-apisports-key": API_FOOTBALL_KEY}
 
 def get_json_with_debug(url, kind, params=None):
-    """Generic GET with debug prints for HTTP code + API 'results'/'errors' fields."""
     try:
         r = requests.get(url, headers=af_headers(), params=params, timeout=TIMEOUT_SEC)
     except Exception as e:
@@ -129,7 +130,6 @@ def find_value(stats_list, team_name, candidates):
     return None
 
 def count_red_cards(events, team_name):
-    """Count red cards for a specific team using the events feed."""
     cnt = 0
     for ev in events:
         t = (ev.get("team") or {}).get("name")
@@ -199,18 +199,18 @@ def scan_once():
                 score_str = f"{home} {gh}-{ga} {away}"
                 prefix = f"{league_name}, {minute}' • {score_str}"
 
-                # A) xG > 1.5 and 0 goals
-                if isinstance(xg,(int,float)) and xg > XG_THRESHOLD and team_goals == 0:
-                    key = make_key(fixture_id, team_name, f"xg_gt_{XG_THRESHOLD}_no_goal")
+                # A) xG >= 0.8 and 0 goals
+                if isinstance(xg,(int,float)) and xg >= XG_THRESHOLD and team_goals == 0:
+                    key = make_key(fixture_id, team_name, f"xg_ge_{XG_THRESHOLD}_no_goal")
                     if key not in sent_alerts:
-                        send_telegram(f"📈 {prefix}\n{team_name} xG = {xg:.2f} but 0 goals vs {opp_name}.")
+                        send_telegram(f"📈 {prefix}\n{team_name} xG = {xg:.2f} with 0 goals vs {opp_name}.")
                         sent_alerts.add(key)
 
-                # B) SOT >= 7 and 0 goals
+                # B) SOT >= 3 and 0 goals
                 if isinstance(sot,(int,float)) and sot >= SOT_THRESHOLD and team_goals == 0:
-                    key = make_key(fixture_id, team_name, "shots7_no_goal")
+                    key = make_key(fixture_id, team_name, f"shotsot_ge_{SOT_THRESHOLD}_no_goal")
                     if key not in sent_alerts:
-                        send_telegram(f"🎯 {prefix}\n{team_name} has {int(sot)} shots on target but 0 goals vs {opp_name}.")
+                        send_telegram(f"🎯 {prefix}\n{team_name} has {int(sot)} shots on target with 0 goals vs {opp_name}.")
                         sent_alerts.add(key)
 
                 # C) Red card for the AWAY team (events)
@@ -220,18 +220,18 @@ def scan_once():
                         send_telegram(f"🟥 {prefix}\nRed card to AWAY team {team_name} vs {opp_name}.")
                         sent_alerts.add(key)
 
-                # D) Corners > 10 and 0 goals
-                if isinstance(crn,(int,float)) and crn > 10 and team_goals == 0:
-                    key = make_key(fixture_id, team_name, "corners_gt10_no_goal")
+                # D) Corners >= 6 and 0 goals
+                if isinstance(crn,(int,float)) and crn >= CORNERS_THRESHOLD and team_goals == 0:
+                    key = make_key(fixture_id, team_name, f"corners_ge_{CORNERS_THRESHOLD}_no_goal")
                     if key not in sent_alerts:
-                        send_telegram(f"🚩 {prefix}\n{team_name} has {int(crn)} corners but 0 goals vs {opp_name}.")
+                        send_telegram(f"🚩 {prefix}\n{team_name} has {int(crn)} corners with 0 goals vs {opp_name}.")
                         sent_alerts.add(key)
 
-                # E) Total shots > 14 and 0 goals
-                if isinstance(tot,(int,float)) and tot > 14 and team_goals == 0:
-                    key = make_key(fixture_id, team_name, "totalshots_gt14_no_goal")
+                # E) Total shots >= 8 and 0 goals
+                if isinstance(tot,(int,float)) and tot >= TOTAL_SHOTS_THRESHOLD and team_goals == 0:
+                    key = make_key(fixture_id, team_name, f"totalshots_ge_{TOTAL_SHOTS_THRESHOLD}_no_goal")
                     if key not in sent_alerts:
-                        send_telegram(f"📸 {prefix}\n{team_name} has {int(tot)} total shots but 0 goals vs {opp_name}.")
+                        send_telegram(f"📸 {prefix}\n{team_name} has {int(tot)} total shots with 0 goals vs {opp_name}.")
                         sent_alerts.add(key)
 
         except Exception as e:
@@ -241,12 +241,12 @@ def scan_once():
 if __name__ == "__main__":
     print("🔑 API_FOOTBALL_KEY in use:", API_FOOTBALL_KEY[:4] + "…" + API_FOOTBALL_KEY[-4:])
     send_telegram("✅ Bot started (API-Football stats alerts + 6h heartbeat)")
-    maybe_send_heartbeat(force=True)  # send startup heartbeat
+    maybe_send_heartbeat(force=True)  # startup heartbeat
 
     while True:
         try:
             scan_once()
-            maybe_send_heartbeat(force=False)  # regular heartbeat check
+            maybe_send_heartbeat(force=False)
         except Exception as e:
             print("❌ Uncaught error in loop:", e)
             time.sleep(5)
