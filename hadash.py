@@ -14,9 +14,10 @@ TIMEOUT_SEC        = 20
 
 # thresholds (UPDATED)
 XG_THRESHOLD            = 0.8
-SOT_THRESHOLD           = 3
+SOT_THRESHOLD           = 4      # ⬅️ raised from 3 to 4
 CORNERS_THRESHOLD       = 6
 TOTAL_SHOTS_THRESHOLD   = 8
+MAX_ALERT_MINUTE        = 60     # ⬅️ do NOT alert after minute > 60
 
 # de-dup alerts
 sent_alerts = set()  # "fixtureId:Team:rule"
@@ -142,6 +143,17 @@ def count_red_cards(events, team_name):
 def make_key(fixture_id, team, rule):
     return f"{fixture_id}:{team}:{rule}"
 
+def to_int_minute(minute):
+    """Coerce elapsed minute to int if possible, else None."""
+    try:
+        if isinstance(minute, (int, float)):
+            return int(minute)
+        if isinstance(minute, str):
+            return int(minute.strip().replace("'", ""))
+    except:
+        return None
+    return None
+
 # ---------- Main scan ----------
 def scan_once():
     global scan_count, last_scan_time
@@ -160,6 +172,7 @@ def scan_once():
             goals     = g.get("goals", {})
             status    = (fixture.get("status") or {})
             minute    = status.get("elapsed", "N/A")
+            minute_int = to_int_minute(minute)
             league_name = league.get("name", "Unknown League")
             fixture_id  = fixture.get("id")
 
@@ -195,6 +208,11 @@ def scan_once():
 
                 print(f"   · {league_name}, {minute}' | {team_name}: SOT={dbg_sot} | xG={dbg_xg} | Shots={dbg_tot} | Corners={dbg_crn} | Reds={dbg_red} | score={home} {gh}-{ga} {away}")
 
+                # ===== Alerts window guard: do not alert after minute > 60 =====
+                if minute_int is None or minute_int > MAX_ALERT_MINUTE:
+                    # Still log, but skip alerts after 60'
+                    continue
+
                 # ===== Alerts =====
                 score_str = f"{home} {gh}-{ga} {away}"
                 prefix = f"{league_name}, {minute}' • {score_str}"
@@ -206,7 +224,7 @@ def scan_once():
                         send_telegram(f"📈 {prefix}\n{team_name} xG = {xg:.2f} with 0 goals vs {opp_name}.")
                         sent_alerts.add(key)
 
-                # B) SOT >= 3 and 0 goals
+                # B) SOT >= 4 and 0 goals  (UPDATED)
                 if isinstance(sot,(int,float)) and sot >= SOT_THRESHOLD and team_goals == 0:
                     key = make_key(fixture_id, team_name, f"shotsot_ge_{SOT_THRESHOLD}_no_goal")
                     if key not in sent_alerts:
