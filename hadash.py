@@ -4,26 +4,24 @@ import requests
 from datetime import datetime
 
 # ========= API key =========
-API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "a7c81be8b4938a51d686b8ebd18c5242")
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
 
-# ========= Telegram destinations =========
-# Primary bot (your existing one)
-PRIMARY_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "7846015183:AAGam93j9_FeRbUEfN6pNPLxoIbJC9fjVfc")
-PRIMARY_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "6468640776")
+# ========= Telegram destinations (NO SECRETS IN CODE) =========
+TELEGRAM_TOKEN_1   = os.getenv("TELEGRAM_TOKEN_1", "").strip()
+TELEGRAM_CHAT_ID_1 = os.getenv("TELEGRAM_CHAT_ID_1", "").strip()
 
-# Extra bot (the new one you provided)
-EXTRA_TOKEN   = os.getenv("TELEGRAM_EXTRA_TOKEN",   "8274943212:AAF8Vq20c3LcyB4zMir4QT_B9lBM41z7dYg")
-EXTRA_CHAT_ID = os.getenv("TELEGRAM_EXTRA_CHAT_ID", "1493637263")
+TELEGRAM_TOKEN_2   = os.getenv("TELEGRAM_TOKEN_2", "").strip()  # optional
+TELEGRAM_CHAT_ID_2 = os.getenv("TELEGRAM_CHAT_ID_2", "").strip()  # optional
 
-# Optional: arbitrary list "TOKEN1|CHATID1,TOKEN2|CHATID2,..."
+# Optional arbitrary list "TOKEN|CHATID,TOKEN|CHATID,..."
 TELEGRAM_DESTINATIONS = os.getenv("TELEGRAM_DESTINATIONS", "").strip()
 
 def _build_destinations():
     dests = []
-    if PRIMARY_TOKEN and PRIMARY_CHAT_ID:
-        dests.append((PRIMARY_TOKEN, PRIMARY_CHAT_ID))
-    if EXTRA_TOKEN and EXTRA_CHAT_ID:
-        dests.append((EXTRA_TOKEN, EXTRA_CHAT_ID))
+    if TELEGRAM_TOKEN_1 and TELEGRAM_CHAT_ID_1:
+        dests.append((TELEGRAM_TOKEN_1, TELEGRAM_CHAT_ID_1))
+    if TELEGRAM_TOKEN_2 and TELEGRAM_CHAT_ID_2:
+        dests.append((TELEGRAM_TOKEN_2, TELEGRAM_CHAT_ID_2))
     if TELEGRAM_DESTINATIONS:
         for part in TELEGRAM_DESTINATIONS.split(","):
             part = part.strip()
@@ -33,7 +31,7 @@ def _build_destinations():
             tok = tok.strip(); cid = cid.strip()
             if tok and cid:
                 dests.append((tok, cid))
-    # dedupe
+    # de-duplicate
     uniq, seen = [], set()
     for t, c in dests:
         k = f"{t}:{c}"
@@ -46,12 +44,14 @@ DESTINATIONS = _build_destinations()
 # ========= Config =========
 SCAN_INTERVAL_SEC        = 120   # every 2 minutes (24/7)
 TIMEOUT_SEC              = 20
-# thresholds
+
+# thresholds (your latest rules)
 XG_THRESHOLD             = 0.8
 SOT_THRESHOLD            = 4
 CORNERS_THRESHOLD        = 6
 TOTAL_SHOTS_THRESHOLD    = 8
-MAX_ALERT_MINUTE         = 60    # don't alert after 60'
+MAX_ALERT_MINUTE         = 60    # don't alert after minute > 60
+
 # heartbeat
 HEARTBEAT_EVERY_SEC      = 10 * 60 * 60  # 10 hours
 start_time               = datetime.utcnow()
@@ -190,9 +190,9 @@ def scan_once():
             minute    = status.get("elapsed", "N/A")
             minute_int = to_int_minute(minute)
 
-            league_name   = league.get("name", "Unknown League")
-            league_country= league.get("country", "Unknown Country")
-            fixture_id    = fixture.get("id")
+            league_name    = league.get("name", "Unknown League")
+            league_country = league.get("country", "Unknown Country")
+            fixture_id     = fixture.get("id")
 
             home = (teams.get("home") or {}).get("name", "Home")
             away = (teams.get("away") or {}).get("name", "Away")
@@ -216,16 +216,16 @@ def scan_once():
                 crn = find_value(stats, team_name, ["corner kicks", "corners"])
                 reds = count_red_cards(events, team_name)
 
-                dbg = {
-                    "xG": f"{xg:.2f}" if isinstance(xg,(int,float)) else "N/A",
-                    "SOT": f"{int(sot)}" if isinstance(sot,(int,float)) else "N/A",
-                    "Shots": f"{int(tot)}" if isinstance(tot,(int,float)) else "N/A",
-                    "Corners": f"{int(crn)}" if isinstance(crn,(int,float)) else "N/A",
-                    "Reds": f"{int(reds)}" if isinstance(reds,(int,float)) else "0",
-                }
-                print(f"   · {league_country} — {league_name}, {minute}' | {team_name}: {dbg} | score={home} {gh}-{ga} {away}")
+                print(
+                    f"   · {league_country} — {league_name}, {minute}' | "
+                    f"{team_name}: SOT={sot if sot is not None else 'N/A'} | "
+                    f"xG={f'{xg:.2f}' if isinstance(xg,(int,float)) else 'N/A'} | "
+                    f"Shots={tot if tot is not None else 'N/A'} | "
+                    f"Corners={crn if crn is not None else 'N/A'} | "
+                    f"Reds={reds} | score={home} {gh}-{ga} {away}"
+                )
 
-                # Do not alert after minute > 60
+                # do not alert after minute > 60
                 if minute_int is None or minute_int > MAX_ALERT_MINUTE:
                     continue
 
@@ -272,7 +272,10 @@ def scan_once():
 
 # =================== Runner (24/7) ===================
 if __name__ == "__main__":
-    print("🔑 API_FOOTBALL_KEY in use:", API_FOOTBALL_KEY[:4] + "…" + API_FOOTBALL_KEY[-4:])
+    key_mask = (API_FOOTBALL_KEY[:4] + "…" + API_FOOTBALL_KEY[-4:]) if API_FOOTBALL_KEY else "(missing)"
+    print("🔑 API_FOOTBALL_KEY:", key_mask)
+    print("📬 Telegram destinations:", ", ".join([cid for _, cid in DESTINATIONS]) or "none")
+
     send_telegram_all("✅ Bot started (API-Football stats alerts, heartbeat 10h, multi-bot)")
     maybe_send_heartbeat(force=True)
 
