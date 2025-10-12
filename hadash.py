@@ -1,27 +1,16 @@
 import os
+import sys
 import time
 from datetime import datetime, timezone
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ================== ENV / KEYS ==================
-API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
-
-TELEGRAM_TOKEN_1   = os.getenv("TELEGRAM_TOKEN_1", "").strip()
-TELEGRAM_CHAT_ID_1 = os.getenv("TELEGRAM_CHAT_ID_1", "").strip()
-
-TELEGRAM_TOKEN_2   = os.getenv("TELEGRAM_TOKEN_2", "").strip()      # optional
-TELEGRAM_CHAT_ID_2 = os.getenv("TELEGRAM_CHAT_ID_2", "").strip()    # optional
-
-# Also optional: "TOKEN|CHATID,TOKEN|CHATID,..."
-TELEGRAM_DESTINATIONS = os.getenv("TELEGRAM_DESTINATIONS", "").strip()
-
 # ================== CONFIG ==================
 SCAN_INTERVAL_SEC         = 120        # every 2 minutes
 TIMEOUT_SEC               = 20
 HEARTBEAT_EVERY_SEC       = 10 * 60 * 60   # 10 hours
-WATCHDOG_STALL_SEC        = 15 * 60        # if no scan for 15 min => alert
+WATCHDOG_STALL_SEC        = 15 * 60        # alert if no progress for 15 min
 
 # thresholds
 XG_THRESHOLD              = 0.8
@@ -30,32 +19,46 @@ CORNERS_THRESHOLD         = 6
 TOTAL_SHOTS_THRESHOLD     = 8
 MAX_ALERT_MINUTE          = 60          # do not alert after minute > 60
 
-# ================== STATE ==================
-start_time        = datetime.now(timezone.utc)
-last_heartbeat_ts = 0.0
-last_progress_ts  = time.time()         # for watchdog
-scan_count        = 0
-last_scan_time    = None
-sent_alerts       = set()               # "fixtureId:Team:rule"
+# ================== ENV HELPERS ==================
+def need_env(name: str) -> str:
+    val = os.getenv(name, "").strip()
+    if not val:
+        print(f"❌ Missing required ENV '{name}'", flush=True)
+    return val
 
-# ================== HTTP SESSION (RETRIES) ==================
-session = requests.Session()
-retry = Retry(
-    total=3,
-    backoff_factor=1.0,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET", "POST"],
-    raise_on_status=False,
-)
-adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
-session.mount("https://", adapter)
-session.mount("http://", adapter)
+def optional_env(name: str) -> str:
+    return os.getenv(name, "").strip()
 
-# ================== TELEGRAM ==================
+# Required ENV (your names)
+API_FOOTBALL_KEY = need_env("API_KEY")  # <— uses API_KEY exactly as you set
+
+# Telegram primary
+TELEGRAM_TOKEN     = optional_env("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID   = optional_env("TELEGRAM_CHAT_ID")
+
+# Telegram extra (optional second bot)
+TELEGRAM_TOKEN_2   = optional_env("TELEGRAM_TOKEN_2")
+TELEGRAM_CHAT_ID_2 = optional_env("TELEGRAM_CHAT_ID_2")
+
+# Optional arbitrary list "TOKEN|CHATID,TOKEN|CHATID,..."
+TELEGRAM_DESTINATIONS = optional_env("TELEGRAM_DESTINATIONS")
+
+# Validate required set
+missing = []
+if not API_FOOTBALL_KEY:
+    missing.append("API_KEY")
+if not ( (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) or TELEGRAM_DESTINATIONS or (TELEGRAM_TOKEN_2 and TELEGRAM_CHAT_ID_2) ):
+    missing.append("Telegram destination (set TELEGRAM_TOKEN & TELEGRAM_CHAT_ID or TELEGRAM_DESTINATIONS or TOKEN_2 & CHAT_ID_2)")
+if missing:
+    print("🚫 Startup aborted. Missing:", ", ".join(missing), flush=True)
+    print("↪ Set them in Render → Service → Environment, then redeploy.", flush=True)
+    sys.exit(1)
+
+# ================== DESTINATIONS ==================
 def _build_destinations():
     dests = []
-    if TELEGRAM_TOKEN_1 and TELEGRAM_CHAT_ID_1:
-        dests.append((TELEGRAM_TOKEN_1, TELEGRAM_CHAT_ID_1))
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        dests.append((TELEGRAM_TOKEN, TELEGRAM_CHAT_ID))
     if TELEGRAM_TOKEN_2 and TELEGRAM_CHAT_ID_2:
         dests.append((TELEGRAM_TOKEN_2, TELEGRAM_CHAT_ID_2))
     if TELEGRAM_DESTINATIONS:
@@ -77,20 +80,42 @@ def _build_destinations():
 
 DESTINATIONS = _build_destinations()
 
+# ================== STATE ==================
+start_time        = datetime.now(timezone.utc)
+last_heartbeat_ts = 0.0
+last_progress_ts  = time.time()
+scan_count        = 0
+last_scan_time    = None
+sent_alerts       = set()   # "fixtureId:Team:rule"
+
+# ================== HTTP SESSION (RETRIES) ==================
+session = requests.Session()
+retry = Retry(
+    total=3,
+    backoff_factor=1.0,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"],
+    raise_on_status=False,
+)
+adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
+# ================== TELEGRAM ==================
 def send_telegram_all(text: str):
     if not DESTINATIONS:
-        print("⚠️ No Telegram destinations configured.")
+        print("⚠️ No Telegram destinations configured.", flush=True)
         return
     for token, chat_id in DESTINATIONS:
         try:
             url = f"https://api.telegram.org/bot{token}/sendMessage"
             r = session.post(url, data={"chat_id": chat_id, "text": text}, timeout=TIMEOUT_SEC)
             if r.status_code != 200:
-                print(f"⚠️ Telegram {chat_id} {r.status_code}: {r.text[:300]}")
+                print(f"⚠️ Telegram {chat_id} {r.status_code}: {r.text[:300]}", flush=True)
             else:
-                print(f"✅ Telegram sent to {chat_id}.")
+                print(f"✅ Telegram sent to {chat_id}.", flush=True)
         except Exception as e:
-            print(f"❌ Telegram exception to {chat_id}: {e}")
+            print(f"❌ Telegram exception to {chat_id}: {e}", flush=True)
 
 def maybe_send_heartbeat(force: bool = False):
     global last_heartbeat_ts, scan_count, last_scan_time
@@ -110,12 +135,11 @@ def maybe_send_heartbeat(force: bool = False):
         last_heartbeat_ts = now_ts
 
 def watchdog_ping():
-    """If no progress for WATCHDOG_STALL_SEC, notify."""
     global last_progress_ts
     now_ts = time.time()
     if now_ts - last_progress_ts >= WATCHDOG_STALL_SEC:
         send_telegram_all("⚠️ Watchdog: no scan progress in the last 15 minutes. Attempting to continue.")
-        last_progress_ts = now_ts  # avoid spamming
+        last_progress_ts = now_ts
 
 # ================== API-FOOTBALL ==================
 def af_headers():
@@ -125,24 +149,24 @@ def get_json_with_debug(url, kind, params=None):
     try:
         r = session.get(url, headers=af_headers(), params=params, timeout=TIMEOUT_SEC)
     except Exception as e:
-        print(f"❌ Network exception ({kind}): {e}")
+        print(f"❌ Network exception ({kind}): {e}", flush=True)
         return None
-    print(f"🌐 {kind} HTTP={r.status_code} url={url}")
+    print(f"🌐 {kind} HTTP={r.status_code} url={url}", flush=True)
     if r.status_code == 429:
-        print("⏳ Rate limited (429). Backoff 30s.")
+        print("⏳ Rate limited (429). Backoff 30s.", flush=True)
         time.sleep(30)
         return None
     ctype = r.headers.get("content-type", "")
     if not ctype.startswith("application/json"):
-        print(f"❌ Non-JSON {kind}: {r.text[:300]}")
+        print(f"❌ Non-JSON {kind}: {r.text[:300]}", flush=True)
         return None
     try:
         js = r.json()
     except Exception:
-        print(f"❌ JSON parse error ({kind}): {r.text[:300]}")
+        print(f"❌ JSON parse error ({kind}): {r.text[:300]}", flush=True)
         return None
     if isinstance(js, dict):
-        print("ℹ️", kind, "results:", js.get("results"), "| errors:", js.get("errors"))
+        print("ℹ️", kind, "results:", js.get("results"), "| errors:", js.get("errors"), flush=True)
     return js
 
 def get_live_fixtures():
@@ -212,9 +236,9 @@ def scan_once():
     scan_count += 1
     last_progress_ts = time.time()
 
-    print(f"🔄 Scan @ {last_scan_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print(f"🔄 Scan @ {last_scan_time.strftime('%Y-%m-%d %H:%M:%S UTC')}", flush=True)
     fixtures = get_live_fixtures()
-    print(f"📊 Found {len(fixtures)} live games")
+    print(f"📊 Found {len(fixtures)} live games", flush=True)
 
     for g in fixtures:
         try:
@@ -239,7 +263,7 @@ def scan_once():
             events = get_fixture_events(fixture_id)
 
             if not stats and not events:
-                print(f"ℹ️ No stats/events yet for {fixture_id} | {league_country} — {league_name}, {minute}' | {home} vs {away}")
+                print(f"ℹ️ No stats/events yet for {fixture_id} | {league_country} — {league_name}, {minute}' | {home} vs {away}", flush=True)
                 continue
 
             for team_name, team_goals, opp_name, is_away in (
@@ -258,7 +282,8 @@ def scan_once():
                     f"xG={f'{xg:.2f}' if isinstance(xg,(int,float)) else 'N/A'} | "
                     f"Shots={tot if tot is not None else 'N/A'} | "
                     f"Corners={crn if crn is not None else 'N/A'} | "
-                    f"Reds={reds} | score={home} {gh}-{ga} {away}"
+                    f"Reds={reds} | score={home} {gh}-{ga} {away}",
+                    flush=True
                 )
 
                 # don't alert after 60'
@@ -304,16 +329,15 @@ def scan_once():
                         sent_alerts.add(key)
 
         except Exception as e:
-            print(f"❌ Exception processing fixture: {e}")
+            print(f"❌ Exception processing fixture: {e}", flush=True)
 
-# ================== MAIN (24/7) ==================
+# ================== MAIN ==================
 if __name__ == "__main__":
-    key_mask = (API_FOOTBALL_KEY[:4] + "…" + API_FOOTBALL_KEY[-4:]) if API_FOOTBALL_KEY else "(missing)"
-    print("🔑 API_FOOTBALL_KEY:", key_mask)
-    print("📬 Telegram destinations:", ", ".join([cid for _, cid in DESTINATIONS]) or "none")
-    send_telegram_all("✅ Bot started (API-Football alerts · heartbeat 10h · watchdog 15m · retries+timeouts)")
+    mask = (API_FOOTBALL_KEY[:4] + "…" + API_FOOTBALL_KEY[-4:]) if API_FOOTBALL_KEY else "(missing)"
+    print("🔑 API_KEY (API-Football):", mask, flush=True)
+    print("📬 Telegram destinations:", ", ".join([cid for _, cid in DESTINATIONS]) or "none", flush=True)
 
-    # initial heartbeat
+    send_telegram_all("✅ Bot started (API-Football alerts · heartbeat 10h · watchdog 15m · retries+timeouts)")
     maybe_send_heartbeat(force=True)
 
     while True:
@@ -322,8 +346,7 @@ if __name__ == "__main__":
             maybe_send_heartbeat(force=False)
             watchdog_ping()
         except Exception as e:
-            # Never crash the worker
-            print(f"❌ Uncaught error in loop: {e}")
+            print(f"❌ Uncaught error in loop: {e}", flush=True)
             send_telegram_all(f"❌ Uncaught error in loop: {e}")
             time.sleep(5)
         time.sleep(SCAN_INTERVAL_SEC)
