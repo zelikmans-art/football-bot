@@ -12,28 +12,20 @@ TIMEOUT_SEC            = 20
 HEARTBEAT_EVERY_SEC    = 10 * 60 * 60   # 10 hours
 WATCHDOG_STALL_SEC     = 15 * 60        # alert if no progress for 15 min
 
-# thresholds
+# thresholds (כמו שסיכמנו)
 XG_THRESHOLD           = 0.8
 SOT_THRESHOLD          = 4
 CORNERS_THRESHOLD      = 6
 TOTAL_SHOTS_THRESHOLD  = 8
-MAX_ALERT_MINUTE       = 60          # do not alert after minute > 60
+MAX_ALERT_MINUTE       = 60          # לא שולחים התראות אחרי דקה 60
 
 # ================== ENV ==================
 def get_env(name, default=""):
     return os.getenv(name, default).strip()
 
-# API keys: support API_KEYS="k1,k2,..." OR API_KEY + API_KEY_2
-_api_keys_csv = get_env("API_KEYS")
-if _api_keys_csv:
-    API_KEYS = [k.strip() for k in _api_keys_csv.split(",") if k.strip()]
-else:
-    k1 = get_env("API_KEY")
-    k2 = get_env("API_KEY_2")
-    API_KEYS = [k for k in [k1, k2] if k]
-
-if not API_KEYS:
-    print("🚫 Missing API keys. Set API_KEYS (comma-separated) or API_KEY [/ API_KEY_2] in Render → Environment.", flush=True)
+API_KEY = get_env("API_KEY")  # ← רק טוקן חדש פה
+if not API_KEY:
+    print("🚫 Missing API_KEY. Set it in Render → Environment.", flush=True)
     sys.exit(1)
 
 # Telegram destinations
@@ -66,7 +58,7 @@ def build_destinations():
 
 DESTINATIONS = build_destinations()
 if not DESTINATIONS:
-    print("🚫 No Telegram destinations. Set TELEGRAM_TOKEN & TELEGRAM_CHAT_ID (or TELEGRAM_DESTINATIONS / *_2).", flush=True)
+    print("🚫 No Telegram destinations. Set TELEGRAM_TOKEN & TELEGRAM_CHAT_ID (or DESTINATIONS / *_2).", flush=True)
     sys.exit(1)
 
 # ================== STATE ==================
@@ -76,7 +68,6 @@ last_progress_ts  = time.time()
 scan_count        = 0
 last_scan_time    = None
 sent_alerts       = set()
-current_key_idx   = 0   # which API key we're using now
 
 # ================== HTTP SESSION (RETRIES) ==================
 session = requests.Session()
@@ -107,9 +98,6 @@ def send_telegram_all(text: str):
         except Exception as e:
             print(f"❌ Telegram exception to {chat_id}: {e}", flush=True)
 
-def mask_key(key: str) -> str:
-    return key[:4] + "…" + key[-4:] if len(key) >= 8 else key
-
 def maybe_send_heartbeat(force=False):
     global last_heartbeat_ts
     now = time.time()
@@ -117,8 +105,7 @@ def maybe_send_heartbeat(force=False):
         uptime = str((datetime.now(timezone.utc) - start_time)).split(".")[0]
         last = last_scan_time.strftime("%Y-%m-%d %H:%M:%S UTC") if last_scan_time else "N/A"
         dests = ", ".join([cid for _, cid in DESTINATIONS]) or "none"
-        active_key = mask_key(API_KEYS[current_key_idx])
-        send_telegram_all(f"✅ Heartbeat\nUptime: {uptime}\nScans: {scan_count}\nLast scan: {last}\nDestinations: {dests}\nAPI key in use: {active_key}")
+        send_telegram_all(f"✅ Heartbeat\nUptime: {uptime}\nScans: {scan_count}\nLast scan: {last}\nDestinations: {dests}")
         last_heartbeat_ts = now
 
 def watchdog_ping():
@@ -127,81 +114,49 @@ def watchdog_ping():
         send_telegram_all("⚠️ Watchdog: no scan progress in the last 15 minutes. Continuing…")
         last_progress_ts = time.time()
 
-# ================== API-FOOTBALL (multi-key) ==================
-def headers_for(key: str):
-    return {"x-apisports-key": key}
+# ================== API-FOOTBALL (single key) ==================
+def af_headers():
+    return {"x-apisports-key": API_KEY}
 
-def api_get_json(url: str, kind: str, params=None, require_non_empty_field: str | None = None):
-    """
-    Tries all API keys (starting from current_key_idx) until success.
-    'require_non_empty_field' = JSON key expected to be non-empty (e.g., 'response')
-    Returns (json, used_key_idx) or (None, None) if all failed.
-    """
-    global current_key_idx
-    keys_to_try = list(range(current_key_idx, len(API_KEYS))) + list(range(0, current_key_idx))
-    for idx in keys_to_try:
-        key = API_KEYS[idx]
-        try:
-            r = session.get(url, headers=headers_for(key), params=params, timeout=TIMEOUT_SEC)
-        except Exception as e:
-            print(f"❌ {kind}: network err with key {mask_key(key)}: {e}", flush=True)
-            continue
-
-        print(f"🌐 {kind} HTTP={r.status_code} key={mask_key(key)} url={url}", flush=True)
-
-        # 429/403/401/5xx -> try next key
-        if r.status_code in (401, 403, 429) or (500 <= r.status_code < 600):
-            print(f"⚠️ {kind}: status {r.status_code} with key {mask_key(key)} → trying next key", flush=True)
-            continue
-
-        ctype = r.headers.get("content-type","")
-        if not ctype.startswith("application/json"):
-            print(f"❌ {kind}: non-JSON with key {mask_key(key)}: {r.text[:200]}", flush=True)
-            continue
-
-        try:
-            js = r.json()
-        except Exception:
-            print(f"❌ {kind}: JSON parse error with key {mask_key(key)}: {r.text[:200]}", flush=True)
-            continue
-
-        # if require_non_empty_field is set, ensure it's “truthy”
-        if require_non_empty_field:
-            val = js.get(require_non_empty_field)
-            if not val:
-                print(f"⚠️ {kind}: empty '{require_non_empty_field}' with key {mask_key(key)} → trying next key", flush=True)
-                continue
-
-        # success → update current key index
-        if idx != current_key_idx:
-            print(f"🔄 Switched API key → now using {mask_key(key)}", flush=True)
-        current_key_idx = idx
-        return js, idx
-
-    print(f"🚫 {kind}: all keys failed or returned empty.", flush=True)
-    return None, None
+def get_json_with_debug(url, kind, params=None):
+    try:
+        r = session.get(url, headers=af_headers(), params=params, timeout=TIMEOUT_SEC)
+    except Exception as e:
+        print(f"❌ Network exception ({kind}): {e}", flush=True)
+        return None
+    print(f"🌐 {kind} HTTP={r.status_code} url={url}", flush=True)
+    if r.status_code == 429:
+        print("⏳ Rate limited (429). Backoff 30s.", flush=True)
+        time.sleep(30)
+        return None
+    ctype = r.headers.get("content-type", "")
+    if not ctype.startswith("application/json"):
+        print(f"❌ Non-JSON {kind}: {r.text[:300]}", flush=True)
+        return None
+    try:
+        js = r.json()
+    except Exception:
+        print(f"❌ JSON parse error ({kind}): {r.text[:300]}", flush=True)
+        return None
+    if isinstance(js, dict):
+        print("ℹ️", kind, "results:", js.get("results"), "| errors:", js.get("errors"), flush=True)
+    return js
 
 def get_live_fixtures():
-    js, _ = api_get_json(
-        "https://v3.football.api-sports.io/fixtures?live=all",
-        "fixtures",
-        require_non_empty_field="response"
-    )
+    js = get_json_with_debug("https://v3.football.api-sports.io/fixtures?live=all", "fixtures")
     return js.get("response") if isinstance(js, dict) else []
 
 def get_fixture_stats(fixture_id: int):
-    js, _ = api_get_json(
+    js = get_json_with_debug(
         f"https://v3.football.api-sports.io/fixtures/statistics?fixture={fixture_id}",
-        f"stats fixture={fixture_id}",
-        require_non_empty_field="response"
+        f"stats fixture={fixture_id}"
     )
     return js.get("response") if isinstance(js, dict) else []
 
 def get_fixture_events(fixture_id: int):
-    js, _ = api_get_json(
+    js = get_json_with_debug(
         f"https://v3.football.api-sports.io/fixtures/events?fixture={fixture_id}",
-        f"events fixture={fixture_id}",
-        require_non_empty_field=None  # events לפעמים ריק; לא נכשיל על זה
+        f"events fixture={fixture_id}"
     )
     return js.get("response") if isinstance(js, dict) else []
 
@@ -348,11 +303,11 @@ def scan_once():
 
 # ================== MAIN ==================
 if __name__ == "__main__":
-    masked = [mask_key(k) for k in API_KEYS]
-    print("🔑 API KEYS loaded:", ", ".join(masked), flush=True)
+    mask = API_KEY[:4] + "…" + API_KEY[-4:] if len(API_KEY) >= 8 else API_KEY
+    print("🔑 API_KEY loaded:", mask, flush=True)
     print("📬 Telegram destinations:", ", ".join([cid for _, cid in DESTINATIONS]), flush=True)
 
-    send_telegram_all("✅ Bot started · multi-API fallback · heartbeat 10h · watchdog 15m · retries+timeouts")
+    send_telegram_all("✅ Bot started · single-API (new token) · heartbeat 10h · watchdog 15m · retries+timeouts")
     maybe_send_heartbeat(force=True)
 
     while True:
