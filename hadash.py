@@ -1,322 +1,233 @@
-import os
-import sys
-import time
+import os, sys, time, json
 from datetime import datetime, timezone
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-# ================== CONFIG ==================
-SCAN_INTERVAL_SEC      = 120        # every 2 minutes
-TIMEOUT_SEC            = 20
-HEARTBEAT_EVERY_SEC    = 10 * 60 * 60   # 10 hours
-WATCHDOG_STALL_SEC     = 15 * 60        # alert if no progress for 15 min
+# ===== Config =====
+SCAN_INTERVAL_SEC = 120
+TIMEOUT_SEC = 20
 
-# thresholds (כמו שסיכמנו)
-XG_THRESHOLD           = 0.8
-SOT_THRESHOLD          = 4
-CORNERS_THRESHOLD      = 6
-TOTAL_SHOTS_THRESHOLD  = 8
-MAX_ALERT_MINUTE       = 60          # לא שולחים התראות אחרי דקה 60
+# ===== ENV =====
+TOKEN = os.getenv("BETSAPI_TOKEN", "").strip()
+TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# ================== ENV ==================
-def get_env(name, default=""):
-    return os.getenv(name, default).strip()
+if not TOKEN:
+    print("🚫 Missing BETSAPI_TOKEN env var"); sys.exit(1)
+if not TG_TOKEN or not TG_CHAT:
+    print("⚠️ Telegram env vars missing; will print only to logs")
 
-API_KEY = get_env("API_KEY")  # ← רק טוקן חדש פה
-if not API_KEY:
-    print("🚫 Missing API_KEY. Set it in Render → Environment.", flush=True)
-    sys.exit(1)
-
-# Telegram destinations
-TELEGRAM_TOKEN     = get_env("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID   = get_env("TELEGRAM_CHAT_ID")
-TELEGRAM_TOKEN_2   = get_env("TELEGRAM_TOKEN_2")
-TELEGRAM_CHAT_ID_2 = get_env("TELEGRAM_CHAT_ID_2")
-TELEGRAM_DESTS_CSV = get_env("TELEGRAM_DESTINATIONS")  # "TOKEN|CHATID,TOKEN|CHATID,..."
-
-def build_destinations():
-    dests = []
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        dests.append((TELEGRAM_TOKEN, TELEGRAM_CHAT_ID))
-    if TELEGRAM_TOKEN_2 and TELEGRAM_CHAT_ID_2:
-        dests.append((TELEGRAM_TOKEN_2, TELEGRAM_CHAT_ID_2))
-    if TELEGRAM_DESTS_CSV:
-        for part in TELEGRAM_DESTS_CSV.split(","):
-            part = part.strip()
-            if "|" in part:
-                tok, cid = part.split("|", 1)
-                if tok.strip() and cid.strip():
-                    dests.append((tok.strip(), cid.strip()))
-    # dedupe
-    seen, uniq = set(), []
-    for t, c in dests:
-        k = f"{t}:{c}"
-        if k not in seen:
-            uniq.append((t, c)); seen.add(k)
-    return uniq
-
-DESTINATIONS = build_destinations()
-if not DESTINATIONS:
-    print("🚫 No Telegram destinations. Set TELEGRAM_TOKEN & TELEGRAM_CHAT_ID (or DESTINATIONS / *_2).", flush=True)
-    sys.exit(1)
-
-# ================== STATE ==================
-start_time        = datetime.now(timezone.utc)
-last_heartbeat_ts = 0.0
-last_progress_ts  = time.time()
-scan_count        = 0
-last_scan_time    = None
-sent_alerts       = set()
-
-# ================== HTTP SESSION (RETRIES) ==================
 session = requests.Session()
-retry = Retry(
-    total=3,
-    backoff_factor=1.0,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET", "POST"],
-    raise_on_status=False,
-)
-adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
-session.mount("https://", adapter)
-session.mount("http://", adapter)
 
-# ================== TELEGRAM ==================
-def send_telegram_all(text: str):
-    for token, chat_id in DESTINATIONS:
-        try:
-            r = session.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                data={"chat_id": chat_id, "text": text},
-                timeout=TIMEOUT_SEC
-            )
-            if r.status_code != 200:
-                print(f"⚠️ Telegram {chat_id} {r.status_code}: {r.text[:300]}", flush=True)
-            else:
-                print(f"✅ Telegram sent to {chat_id}.", flush=True)
-        except Exception as e:
-            print(f"❌ Telegram exception to {chat_id}: {e}", flush=True)
-
-def maybe_send_heartbeat(force=False):
-    global last_heartbeat_ts
-    now = time.time()
-    if force or (now - last_heartbeat_ts >= HEARTBEAT_EVERY_SEC):
-        uptime = str((datetime.now(timezone.utc) - start_time)).split(".")[0]
-        last = last_scan_time.strftime("%Y-%m-%d %H:%M:%S UTC") if last_scan_time else "N/A"
-        dests = ", ".join([cid for _, cid in DESTINATIONS]) or "none"
-        send_telegram_all(f"✅ Heartbeat\nUptime: {uptime}\nScans: {scan_count}\nLast scan: {last}\nDestinations: {dests}")
-        last_heartbeat_ts = now
-
-def watchdog_ping():
-    global last_progress_ts
-    if time.time() - last_progress_ts >= WATCHDOG_STALL_SEC:
-        send_telegram_all("⚠️ Watchdog: no scan progress in the last 15 minutes. Continuing…")
-        last_progress_ts = time.time()
-
-# ================== API-FOOTBALL (single key) ==================
-def af_headers():
-    return {"x-apisports-key": API_KEY}
-
-def get_json_with_debug(url, kind, params=None):
+def tgsend(msg: str):
+    if not TG_TOKEN or not TG_CHAT: 
+        return
     try:
-        r = session.get(url, headers=af_headers(), params=params, timeout=TIMEOUT_SEC)
+        r = session.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            data={"chat_id": TG_CHAT, "text": msg},
+            timeout=10
+        )
+        if r.status_code != 200:
+            print(f"⚠️ Telegram {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        print(f"❌ Network exception ({kind}): {e}", flush=True)
+        print("⚠️ Telegram exception:", e)
+
+def get_json(url: str, kind: str, params=None):
+    try:
+        r = session.get(url, params=params, timeout=TIMEOUT_SEC)
+        print(f"🌐 {kind} {r.status_code} → {r.url}")
+    except Exception as e:
+        print(f"❌ {kind} network error: {e}")
         return None
-    print(f"🌐 {kind} HTTP={r.status_code} url={url}", flush=True)
-    if r.status_code == 429:
-        print("⏳ Rate limited (429). Backoff 30s.", flush=True)
-        time.sleep(30)
-        return None
-    ctype = r.headers.get("content-type", "")
-    if not ctype.startswith("application/json"):
-        print(f"❌ Non-JSON {kind}: {r.text[:300]}", flush=True)
+    ct = r.headers.get("content-type","")
+    if "application/json" not in ct:
+        print(f"❌ {kind} non-JSON: {r.text[:300]}")
         return None
     try:
         js = r.json()
     except Exception:
-        print(f"❌ JSON parse error ({kind}): {r.text[:300]}", flush=True)
+        print(f"❌ {kind} JSON parse error: {r.text[:300]}")
         return None
+    # BetsAPI נוהג להחזיר success/results/error
     if isinstance(js, dict):
-        print("ℹ️", kind, "results:", js.get("results"), "| errors:", js.get("errors"), flush=True)
+        print("ℹ️", kind, "success:", js.get("success"), "| results:", js.get("results"), "| error:", js.get("error") or js.get("errors"))
     return js
 
-def get_live_fixtures():
-    js = get_json_with_debug("https://v3.football.api-sports.io/fixtures?live=all", "fixtures")
-    return js.get("response") if isinstance(js, dict) else []
+# ---- BetsAPI endpoints ----
+def fetch_inplay_soccer():
+    # sport_id=1 -> Soccer
+    url = "https://api.b365api.com/v3/events/inplay"
+    return get_json(url, "inplay", {"sport_id": 1, "token": TOKEN})
 
-def get_fixture_stats(fixture_id: int):
-    js = get_json_with_debug(
-        f"https://v3.football.api-sports.io/fixtures/statistics?fixture={fixture_id}",
-        f"stats fixture={fixture_id}"
-    )
-    return js.get("response") if isinstance(js, dict) else []
+def fetch_event_view(event_id):
+    url = "https://api.b365api.com/v1/event/view"
+    return get_json(url, f"event_view:{event_id}", {"event_id": event_id, "token": TOKEN})
 
-def get_fixture_events(fixture_id: int):
-    js = get_json_with_debug(
-        f"https://v3.football.api-sports.io/fixtures/events?fixture={fixture_id}",
-        f"events fixture={fixture_id}"
-    )
-    return js.get("response") if isinstance(js, dict) else []
+def fetch_stats_trend(event_id):
+    # לא תמיד קיים לכל משחק/חבילה, אבל ננסה ונדפיס דוגמית אם יש
+    url = "https://api.b365api.com/v1/event/stats_trend"
+    return get_json(url, f"stats_trend:{event_id}", {"event_id": event_id, "token": TOKEN})
 
-# ================== STAT HELPERS ==================
-def find_value(stats_list, team_name, candidates):
-    for block in stats_list or []:
-        if (block.get("team") or {}).get("name") != team_name:
-            continue
-        for row in (block.get("statistics") or []):
-            t = str(row.get("type","")).lower()
-            if not any(c in t for c in candidates):
-                continue
-            v = row.get("value")
-            if isinstance(v, (int, float)):
-                return float(v)
-            if isinstance(v, str):
-                s = v.strip().rstrip("%")
-                try:
-                    return float(s)
-                except:
-                    pass
-    return None
+# ---- helpers to extract stats from event_view payloads (שונות בין ליגות/פיצ'רים) ----
+def try_extract_basic_stats(ev_view):
+    """
+    מחפש שדות כמו shots_on_target / shots / corners אם קיימים.
+    בגלל שהפורמט משתנה, נעבור בצורה חסינה על כל dict/array ונאתר מפתחות שמכילים את המילים הרלוונטיות.
+    """
+    out = {"SOT": None, "Shots": None, "Corners": None}
+    if not isinstance(ev_view, dict):
+        return out
 
-def count_red_cards(events, team_name):
-    cnt = 0
-    for ev in events or []:
-        tname = (ev.get("team") or {}).get("name")
-        typ   = (ev.get("type") or "").lower()
-        det   = (ev.get("detail") or "").lower()
-        if tname == team_name and ("red card" in det or (typ == "card" and "red" in det)):
-            cnt += 1
-    return cnt
+    def scan_obj(obj):
+        # obj יכול להיות dict או list; נסרוק רק מפתחות/מחרוזות
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                kl = str(k).lower()
+                if any(t in kl for t in ["shot_on_target","shots_on_target","shots on target","sot"]):
+                    out["SOT"] = safe_num(v)
+                if "corner" in kl:
+                    out["Corners"] = max_non_none(out["Corners"], safe_num(v))
+                if ("total_shots" in kl) or ("shots_total" in kl) or (kl == "shots") or ("shots" in kl and "on" not in kl):
+                    out["Shots"] = max_non_none(out["Shots"], safe_num(v))
+                # רקורסיה
+                scan_obj(v)
+        elif isinstance(obj, list):
+            for it in obj:
+                scan_obj(it)
 
-def to_int_minute(minute):
+    scan_obj(ev_view)
+    return out
+
+def max_non_none(a, b):
+    if a is None: return b
+    if b is None: return a
     try:
-        if isinstance(minute, (int, float)): return int(minute)
-        if isinstance(minute, str): return int(minute.strip().replace("'", ""))
+        return max(float(a), float(b))
+    except:
+        return a
+
+def safe_num(v):
+    # מנסה להמיר ערכים כמו "7", "7:3", "7-3", "7%" וכו'
+    if v is None: return None
+    if isinstance(v, (int, float)): return float(v)
+    s = str(v).strip()
+    # pair "H:A"
+    if ":" in s:
+        try:
+            h, a = s.split(":", 1)
+            return float(h), float(a)
+        except:
+            return None
+    # remove % or other junk
+    s = s.rstrip("%")
+    try:
+        return float(s)
     except:
         return None
-    return None
 
-def make_key(fixture_id, team, rule):
-    return f"{fixture_id}:{team}:{rule}"
+def count_red_cards_from_events(ev_view):
+    reds_home = reds_away = 0
+    # מחפש מערך events אם קיים
+    events = None
+    # מיקומים אפשריים
+    for key in ["events", "event", "timeline"]:
+        if isinstance(ev_view, dict) and key in ev_view:
+            events = ev_view[key]; break
+    if not isinstance(events, list):
+        return 0, 0
+    for e in events:
+        # בדוק יש "type/detail" שמכילים red
+        text = " ".join(str(e.get(k,"")).lower() for k in ["type","detail","desc","comment"])
+        if "red" in text:
+            # נסה להבין בית/חוץ
+            side = (e.get("side") or e.get("team") or "").lower()
+            if side in ("home","h","1"):
+                reds_home += 1
+            elif side in ("away","a","2"):
+                reds_away += 1
+            else:
+                # fallback: אם יש player_home/player_away
+                if e.get("player_home") and not e.get("player_away"): reds_home += 1
+                elif e.get("player_away") and not e.get("player_home"): reds_away += 1
+                else:
+                    # לא ברור—לא נספור
+                    pass
+    return reds_home, reds_away
 
-# ================== SCAN ==================
+# ---- main scan ----
 def scan_once():
-    global scan_count, last_scan_time, last_progress_ts
-    last_scan_time = datetime.now(timezone.utc)
-    scan_count += 1
-    last_progress_ts = time.time()
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"🔄 Scan @ {ts}")
 
-    print(f"🔄 Scan @ {last_scan_time.strftime('%Y-%m-%d %H:%M:%S UTC')}", flush=True)
-    fixtures = get_live_fixtures()
-    print(f"📊 Found {len(fixtures)} live games", flush=True)
+    js_inplay = fetch_inplay_soccer()
+    if not isinstance(js_inplay, dict):
+        print("❌ Bad inplay response"); return
 
-    for g in fixtures:
-        try:
-            fixture   = g.get("fixture", {})
-            league    = g.get("league", {})
-            teams     = g.get("teams", {})
-            goals     = g.get("goals", {})
-            status    = (fixture.get("status") or {})
-            minute    = status.get("elapsed", "N/A")
-            minute_i  = to_int_minute(minute)
-            fixture_id = fixture.get("id")
+    # חלק מהתגובות מגיעות תחת keys שונים. בד"כ data או results/ pager… ננסה כמה אופציות
+    events = js_inplay.get("results") or js_inplay.get("data") or js_inplay.get("events") or []
+    if isinstance(events, dict):
+        # לפעמים events באובייקט עם מפתח data
+        events = events.get("data") or []
 
-            league_name    = league.get("name", "Unknown League")
-            league_country = league.get("country", "Unknown Country")
-            home = (teams.get("home") or {}).get("name", "Home")
-            away = (teams.get("away") or {}).get("name", "Away")
-            gh   = goals.get("home", 0) or 0
-            ga   = goals.get("away", 0) or 0
+    print(f"📊 Inplay count: {len(events)}")
 
-            stats  = get_fixture_stats(fixture_id)
-            events = get_fixture_events(fixture_id)
+    # אם אין אירועים—שגר התראה חד־פעמית כדי לדעת שהמפתח עובד אבל אין נתונים
+    if not events:
+        print("ℹ️ No inplay events right now.")
+        return
 
-            if not stats and not events:
-                print(f"ℹ️ No stats/events yet for {fixture_id} | {league_country} — {league_name}, {minute}' | {home} vs {away}", flush=True)
-                continue
+    # עבור כל משחק הצג פרטים בסיסיים, ושלוף event/view כדי לבדוק אם יש סטטיסטיקות
+    for idx, ev in enumerate(events[:20], start=1):  # הגבלת דוגמא לוגים ל-20 כדי לא להציף
+        event_id = ev.get("id") or ev.get("event_id") or ev.get("FI") or ev.get("EV")  # שמות נפוצים
+        home = ev.get("home", ev.get("home_team"))
+        away = ev.get("away", ev.get("away_team"))
+        league = ev.get("league", ev.get("league_name") or ev.get("league_str"))
+        cc = ev.get("cc", ev.get("country", ev.get("country_name")))
+        minute = ev.get("timer", ev.get("time", ev.get("match_time")))
+        score = ev.get("ss") or f"{ev.get('home_score','?')}-{ev.get('away_score','?')}"
 
-            for team_name, team_goals, opp_name, is_away in (
-                (home, gh, away, False),
-                (away, ga, home, True),
-            ):
-                xg  = find_value(stats, team_name, ["expected goals", "xg"])
-                sot = find_value(stats, team_name, ["shots on goal", "shots on target"])
-                tot = find_value(stats, team_name, ["total shots", "shots total", "shots"])
-                crn = find_value(stats, team_name, ["corner kicks", "corners"])
-                reds = count_red_cards(events, team_name)
+        print(f"   • [{idx}] {cc or '—'} / {league or '—'} | {minute or 'N/A'} | {home} {score} {away} | id={event_id}")
 
-                print(
-                    f"   · {league_country} — {league_name}, {minute}' | "
-                    f"{team_name}: SOT={sot if sot is not None else 'N/A'} | "
-                    f"xG={f'{xg:.2f}' if isinstance(xg,(int,float)) else 'N/A'} | "
-                    f"Shots={tot if tot is not None else 'N/A'} | "
-                    f"Corners={crn if crn is not None else 'N/A'} | "
-                    f"Reds={reds} | score={home} {gh}-{ga} {away}",
-                    flush=True
-                )
+        if not event_id:
+            continue
 
-                if minute_i is None or minute_i > MAX_ALERT_MINUTE:
-                    continue
+        view = fetch_event_view(event_id)
+        if not isinstance(view, dict):
+            print("      ↪ no event_view json")
+            continue
 
-                score_str = f"{home} {gh}-{ga} {away}"
-                prefix = f"{league_country} — {league_name}, {minute}' • {score_str}"
+        # לרוב ה-payload האמיתי נמצא תחת 'results' או 'data'
+        payload = view.get("results") or view.get("data") or view
+        # הדפס sample keys פעם ראשונה כדי להבין מה יש
+        if idx <= 3:
+            # הצג רק כותרות ו-sample קטן
+            print("      ↪ keys:", list(payload.keys())[:10] if isinstance(payload, dict) else type(payload))
 
-                # xG rule
-                if isinstance(xg,(int,float)) and xg >= XG_THRESHOLD and team_goals == 0:
-                    key = make_key(fixture_id, team_name, "xg_thresh")
-                    if key not in sent_alerts:
-                        send_telegram_all(f"📈 {prefix}\n{team_name} xG = {xg:.2f} with 0 goals vs {opp_name}.")
-                        sent_alerts.add(key)
+        # נסה לחלץ סטטיסטיקות
+        stats = try_extract_basic_stats(payload)
+        reds_h, reds_a = count_red_cards_from_events(payload)
 
-                # SOT rule
-                if isinstance(sot,(int,float)) and sot >= SOT_THRESHOLD and team_goals == 0:
-                    key = make_key(fixture_id, team_name, "sot_thresh")
-                    if key not in sent_alerts:
-                        send_telegram_all(f"🎯 {prefix}\n{team_name} has {int(sot)} shots on target with 0 goals vs {opp_name}.")
-                        sent_alerts.add(key)
+        # הדפס תקציר לכל משחק
+        print(f"      ↪ Stats? SOT={stats['SOT']} | Shots={stats['Shots']} | Corners={stats['Corners']} | Reds H/A={reds_h}/{reds_a}")
 
-                # Corners rule
-                if isinstance(crn,(int,float)) and crn >= CORNERS_THRESHOLD and team_goals == 0:
-                    key = make_key(fixture_id, team_name, "corners_thresh")
-                    if key not in sent_alerts:
-                        send_telegram_all(f"🚩 {prefix}\n{team_name} has {int(crn)} corners with 0 goals vs {opp_name}.")
-                        sent_alerts.add(key)
+        # אופציונלי: ננסה גם stats_trend (לא לכל אחד יש)
+        if idx <= 2:
+            st = fetch_stats_trend(event_id)
+            if isinstance(st, dict):
+                # הדפס כמה שדות לדוגמה כדי שתראה אם זה פעיל אצלך
+                sample = st.get("results") or st.get("data") or {}
+                print("      ↪ stats_trend sample keys:", list(sample.keys())[:10] if isinstance(sample, dict) else type(sample))
 
-                # Total shots rule
-                if isinstance(tot,(int,float)) and tot >= TOTAL_SHOTS_THRESHOLD and team_goals == 0:
-                    key = make_key(fixture_id, team_name, "totalshots_thresh")
-                    if key not in sent_alerts:
-                        send_telegram_all(f"📸 {prefix}\n{team_name} has {int(tot)} total shots with 0 goals vs {opp_name}.")
-                        sent_alerts.add(key)
-
-                # Red card away
-                if is_away and isinstance(reds,(int,float)) and int(reds) >= 1:
-                    key = make_key(fixture_id, team_name, "red_away")
-                    if key not in sent_alerts:
-                        send_telegram_all(f"🟥 {prefix}\nRed card to AWAY team {team_name} vs {opp_name}.")
-                        sent_alerts.add(key)
-
-        except Exception as e:
-            print(f"❌ Exception processing fixture: {e}", flush=True)
-
-# ================== MAIN ==================
 if __name__ == "__main__":
-    mask = API_KEY[:4] + "…" + API_KEY[-4:] if len(API_KEY) >= 8 else API_KEY
-    print("🔑 API_KEY loaded:", mask, flush=True)
-    print("📬 Telegram destinations:", ", ".join([cid for _, cid in DESTINATIONS]), flush=True)
-
-    send_telegram_all("✅ Bot started · single-API (new token) · heartbeat 10h · watchdog 15m · retries+timeouts")
-    maybe_send_heartbeat(force=True)
+    print("🔑 Using BetsAPI token:", TOKEN[:4] + "…" + TOKEN[-4:] if len(TOKEN) >= 8 else TOKEN)
+    if TG_TOKEN and TG_CHAT:
+        tgsend("✅ BetsAPI test bot started (single-provider).")
 
     while True:
         try:
             scan_once()
-            maybe_send_heartbeat(False)
-            watchdog_ping()
         except Exception as e:
-            print(f"❌ Uncaught error in loop: {e}", flush=True)
-            send_telegram_all(f"❌ Uncaught error in loop: {e}")
+            print("❌ Uncaught:", e)
+            tgsend(f"❌ Uncaught: {e}")
             time.sleep(5)
         time.sleep(SCAN_INTERVAL_SEC)
