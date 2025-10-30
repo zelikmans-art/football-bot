@@ -1,12 +1,12 @@
+# hadash.py
 import os
 import re
 import time
 import requests
 from datetime import datetime
 import pytz
-import sys
 
-# ================== ENV VARS ==================
+# ================== ENV VARS (keep secrets out of code) ==================
 BETSAPI_TOKEN      = os.getenv("BETSAPI_TOKEN", "").strip()
 
 TELEGRAM_TOKEN_1   = os.getenv("TELEGRAM_TOKEN_1", "").strip()
@@ -20,18 +20,21 @@ TZ                 = pytz.timezone("Asia/Jerusalem")
 BET_BASE           = "https://api.betsapi.com/v1/bet365"
 TIMEOUT            = 20
 
-SCAN_INTERVAL_DAY  = 30        # seconds (09:00–23:30)
-SCAN_INTERVAL_NGT  = 480       # seconds (23:31–08:59)
+# Scan cadence: 09:00–23:30 every 30s; 23:31–08:59 every 8m
+SCAN_INTERVAL_DAY  = 30
+SCAN_INTERVAL_NGT  = 8 * 60
 MAX_MINUTE         = 65
+
 HEARTBEAT_SEC      = 10 * 60 * 60  # every 10h
 
-# Alert thresholds
-SOT_MIN            = 6
-SHOTS_MIN          = 12
-CORNERS_MIN        = 8
-XG_MIN             = 1.0
-KPASS_MIN          = 6
+# Alert thresholds (your rules)
+SOT_MIN            = 6     # 6+ shots on target, no goal
+SHOTS_MIN          = 12    # 12+ total shots, no goal
+CORNERS_MIN        = 8     # 8+ corners, no goal
+XG_MIN             = 1.0   # xG >= 1.0, no goal
+KPASS_MIN          = 6     # 6+ key passes, no goal
 
+# De-dup memory
 sent_alerts = set()
 
 # ================== TELEGRAM ==================
@@ -48,26 +51,34 @@ def send_telegram(text: str):
             data = {"chat_id": chat_id, "text": text}
             r = requests.post(url, data=data, timeout=10)
             if r.status_code != 200:
-                print(f"⚠️ Telegram {chat_id} error {r.status_code}: {r.text[:150]}", flush=True)
+                print(f"⚠️ Telegram {chat_id} error {r.status_code}: {r.text[:160]}")
             else:
-                print(f"✅ Telegram sent to {chat_id}", flush=True)
+                print(f"✅ Telegram sent to {chat_id}")
         except Exception as e:
-            print("⚠️ Telegram exception:", e, flush=True)
+            print("⚠️ Telegram exception:", e)
 
 # ================== HELPERS ==================
 def parse_minute(val) -> int:
-    if val is None: return 0
+    """Extract minute from '45', '45+2', '90+3', or int/None."""
+    if val is None:
+        return 0
+    if isinstance(val, int):
+        return val
     s = str(val)
     m = re.match(r"^\s*(\d+)", s)
     return int(m.group(1)) if m else 0
 
 def to_int(x, default=0):
-    try: return int(float(x))
-    except: return default
+    try:
+        return int(float(x))
+    except Exception:
+        return default
 
 def to_float(x, default=0.0):
-    try: return float(x)
-    except: return default
+    try:
+        return float(x)
+    except Exception:
+        return default
 
 def first_nonempty(*vals):
     for v in vals:
@@ -76,52 +87,69 @@ def first_nonempty(*vals):
     return None
 
 def match_header(country, league, home, away):
-    return f"{country or '—'} — {league or '—'}\n{home or 'Home'} vs {away or 'Away'}"
+    cn = country or "—"
+    lg = league or "—"
+    h  = home or "Home"
+    a  = away or "Away"
+    return f"{cn} — {lg}\n{h} vs {a}"
 
 def flatten_results(results):
+    """/bet365/inplay returns nested arrays of EV objects."""
     out = []
     if isinstance(results, list):
         for block in results:
-            if isinstance(block, list): out.extend(block)
-            elif isinstance(block, dict): out.append(block)
+            if isinstance(block, list):
+                out.extend(block)
+            elif isinstance(block, dict):
+                out.append(block)
     elif isinstance(results, dict):
         out.append(results)
     return out
 
-# ================== API ==================
+# ================== BETSAPI CALLS ==================
 def fetch_inplay():
     url = f"{BET_BASE}/inplay"
     params = {"sport_id": 1, "token": BETSAPI_TOKEN}
-    r = requests.get(url, params=params, timeout=TIMEOUT)
-    # debug url incl. query
-    print(f"🌐 GET {r.url} | status={r.status_code}", flush=True)
     try:
+        r = requests.get(url, params=params, timeout=TIMEOUT)
+        print(f"🌐 GET {r.url} | status={r.status_code}")
         js = r.json()
+        if js.get("success") == 1:
+            return js.get("results", [])
+        print("⚠️ inplay error payload:", js)
     except Exception as e:
-        print("❌ inplay non-JSON:", e, flush=True)
-        return []
-    if js.get("success") == 1:
-        return js.get("results", [])
-    print("⚠️ inplay error payload:", js, flush=True)
+        print("❌ inplay exception:", e)
     return []
 
 def fetch_event_stats(fi_id: str):
+    """
+    Support said: use /bet365/event?FI=<EV_ID>&stats=1 for stats.
+    Some EV_IDs do not return stats (PARAM_INVALID) depending on coverage.
+    """
     url = f"{BET_BASE}/event"
     params = {"FI": fi_id, "stats": 1, "token": BETSAPI_TOKEN}
-    r = requests.get(url, params=params, timeout=TIMEOUT)
-    print(f"   ↪ GET {r.url} | status={r.status_code}", flush=True)
     try:
+        r = requests.get(url, params=params, timeout=TIMEOUT)
+        print(f"   ↪ GET {r.url} | status={r.status_code}")
         js = r.json()
+        if js.get("success") == 1:
+            return js.get("results")
+        else:
+            # Log error details to understand coverage
+            print(f"   ⚠️ event error for FI={fi_id}: {js}")
+            return None
     except Exception as e:
-        print(f"   ❌ event non-JSON for FI={fi_id}:", e, flush=True)
+        print(f"   ❌ event exception for FI={fi_id}:", e)
         return None
-    if js.get("success") == 1:
-        return js.get("results")
-    else:
-        print(f"   ⚠️ event error for FI={fi_id}: {js}", flush=True)
-    return None
 
 def extract_team_stats(stats_payload):
+    """
+    Normalize team stats from BetsAPI bet365/event response.
+    Often it's a list [home, away] with keys 'S1','S2',...:
+      S1 = On Target, S2 = Off Target
+      SC = goals, XG = expected goals
+    Other fields may be missing; we handle defensively.
+    """
     if isinstance(stats_payload, list) and len(stats_payload) >= 2:
         home, away = stats_payload[0], stats_payload[1]
     elif isinstance(stats_payload, dict) and "stats" in stats_payload:
@@ -133,87 +161,129 @@ def extract_team_stats(stats_payload):
     else:
         return None, None
 
-    def get_val(d, keys, conv=to_int, default=0):
-        for k in keys:
-            if k in d: return conv(d.get(k, default))
-        return default
+    # Heuristics for additional fields that aren't standard everywhere
+    def get_corners(d):
+        for k in ("Corners", "corners", "C", "S10", "S11"):
+            if k in d and d.get(k) not in ("", None):
+                return to_int(d.get(k), 0)
+        return 0
+
+    def get_keypasses(d):
+        for k in ("KP", "KeyPasses", "key_passes", "keypasses"):
+            if k in d and d.get(k) not in ("", None):
+                return to_int(d.get(k), 0)
+        return 0
+
+    def get_yellows(d):
+        for k in ("YC", "Y", "Yellow", "yellow_cards", "yellow"):
+            if k in d and d.get(k) not in ("", None):
+                return to_int(d.get(k), 0)
+        return 0
+
+    def has_red(d):
+        for k in ("RC", "R", "red", "red_cards"):
+            if k in d and d.get(k) not in ("", None):
+                try:
+                    return int(d.get(k)) >= 1
+                except Exception:
+                    return str(d.get(k)) == "1"
+        return False
+
+    def get_xg(d):
+        for k in ("XG", "xg"):
+            if k in d and d.get(k) not in ("", None):
+                return to_float(d.get(k), 0.0)
+        return 0.0
 
     H = {
-        "sot":      get_val(home, ["S1"]),
-        "shots":    get_val(home, ["S1"]) + get_val(home, ["S2"]),
-        "corners":  get_val(home, ["S10", "S11", "Corners"], default=0),
-        "xg":       get_val(home, ["XG", "xg"], conv=to_float, default=0.0),
-        "kpass":    get_val(home, ["KP", "KeyPasses"], default=0),
-        "yellows":  get_val(home, ["YC", "Y"], default=0),
-        "has_red":  get_val(home, ["RC", "R"], default=0) > 0,
-        "goals":    get_val(home, ["SC"], default=0),
+        "sot":      to_int(home.get("S1", 0), 0),
+        "shots":    to_int(home.get("S1", 0), 0) + to_int(home.get("S2", 0), 0),
+        "corners":  get_corners(home),
+        "xg":       get_xg(home),
+        "kpass":    get_keypasses(home),
+        "yellows":  get_yellows(home),
+        "has_red":  has_red(home),
+        "goals":    to_int(home.get("SC", 0), 0),
+        "team_id":  first_nonempty(home.get("TD"), home.get("team_id"), "Home"),
     }
     A = {
-        "sot":      get_val(away, ["S1"]),
-        "shots":    get_val(away, ["S1"]) + get_val(away, ["S2"]),
-        "corners":  get_val(away, ["S10", "S11", "Corners"], default=0),
-        "xg":       get_val(away, ["XG", "xg"], conv=to_float, default=0.0),
-        "kpass":    get_val(away, ["KP", "KeyPasses"], default=0),
-        "yellows":  get_val(away, ["YC", "Y"], default=0),
-        "has_red":  get_val(away, ["RC", "R"], default=0) > 0,
-        "goals":    get_val(away, ["SC"], default=0),
+        "sot":      to_int(away.get("S1", 0), 0),
+        "shots":    to_int(away.get("S1", 0), 0) + to_int(away.get("S2", 0), 0),
+        "corners":  get_corners(away),
+        "xg":       get_xg(away),
+        "kpass":    get_keypasses(away),
+        "yellows":  get_yellows(away),
+        "has_red":  has_red(away),
+        "goals":    to_int(away.get("SC", 0), 0),
+        "team_id":  first_nonempty(away.get("TD"), away.get("team_id"), "Away"),
     }
     return H, A
 
-# ================== ALERTS ==================
-def check_and_alert(ev, minute, header, fi_id, H, A):
+def check_and_alert(ev: dict, minute: int, header_line: str, fi_id: str, H: dict, A: dict):
+    """Apply alert rules and send Telegram notifications with de-dup."""
     alerts = []
 
+    # 6+ SOT without goal
     if H["sot"] >= SOT_MIN and H["goals"] == 0:
-        alerts.append(("sot_home", f"🎯 {header}\nHome 6+ shots on target, no goals."))
+        alerts.append(("sot6_home", f"🎯 {header_line}\nHome: {H['sot']} shots on target, no goals."))
     if A["sot"] >= SOT_MIN and A["goals"] == 0:
-        alerts.append(("sot_away", f"🎯 {header}\nAway 6+ shots on target, no goals."))
+        alerts.append(("sot6_away", f"🎯 {header_line}\nAway: {A['sot']} shots on target, no goals."))
 
+    # 12+ total shots without goal
     if H["shots"] >= SHOTS_MIN and H["goals"] == 0:
-        alerts.append(("shots_home", f"🔥 {header}\nHome 12+ total shots, no goals."))
+        alerts.append(("shots12_home", f"🔥 {header_line}\nHome: {H['shots']} total shots, no goals."))
     if A["shots"] >= SHOTS_MIN and A["goals"] == 0:
-        alerts.append(("shots_away", f"🔥 {header}\nAway 12+ total shots, no goals."))
+        alerts.append(("shots12_away", f"🔥 {header_line}\nAway: {A['shots']} total shots, no goals."))
 
+    # 8+ corners without goal
     if H["corners"] >= CORNERS_MIN and H["goals"] == 0:
-        alerts.append(("corners_home", f"🏁 {header}\nHome 8+ corners, no goals."))
+        alerts.append(("corners8_home", f"🏁 {header_line}\nHome: {H['corners']} corners, no goals."))
     if A["corners"] >= CORNERS_MIN and A["goals"] == 0:
-        alerts.append(("corners_away", f"🏁 {header}\nAway 8+ corners, no goals."))
+        alerts.append(("corners8_away", f"🏁 {header_line}\nAway: {A['corners']} corners, no goals."))
 
+    # xG >= 1.0 without goal
     if H["xg"] >= XG_MIN and H["goals"] == 0:
-        alerts.append(("xg_home", f"📊 {header}\nHome xG≥1.0, no goals."))
+        alerts.append(("xg1_home", f"📊 {header_line}\nHome xG={H['xg']:.2f}, no goals."))
     if A["xg"] >= XG_MIN and A["goals"] == 0:
-        alerts.append(("xg_away", f"📊 {header}\nAway xG≥1.0, no goals."))
+        alerts.append(("xg1_away", f"📊 {header_line}\nAway xG={A['xg']:.2f}, no goals."))
 
+    # 6+ key passes without goal
     if H["kpass"] >= KPASS_MIN and H["goals"] == 0:
-        alerts.append(("kpass_home", f"🎯 {header}\nHome 6+ key passes, no goals."))
+        alerts.append(("kpass6_home", f"🎯 {header_line}\nHome: {H['kpass']} key passes, no goals."))
     if A["kpass"] >= KPASS_MIN and A["goals"] == 0:
-        alerts.append(("kpass_away", f"🎯 {header}\nAway 6+ key passes, no goals."))
+        alerts.append(("kpass6_away", f"🎯 {header_line}\nAway: {A['kpass']} key passes, no goals."))
 
+    # Any red card
     if H["has_red"]:
-        alerts.append(("red_home", f"🟥 {header}\nRed card for Home."))
+        alerts.append(("red_home", f"🟥 {header_line}\nRed card for Home."))
     if A["has_red"]:
-        alerts.append(("red_away", f"🟥 {header}\nRed card for Away."))
+        alerts.append(("red_away", f"🟥 {header_line}\nRed card for Away."))
 
+    # Halftime no yellows
     if minute == 45 and (H["yellows"] + A["yellows"] == 0):
-        alerts.append(("no_yellows", f"⚠️ {header}\n45': No yellow cards so far."))
+        alerts.append(("ht_no_yellows", f"⚠️ {header_line}\n45': No yellow cards so far."))
 
+    # Emit (dedup)
     for tag, msg in alerts:
         key = f"{fi_id}:{tag}"
-        if key not in sent_alerts:
-            send_telegram(msg)
-            print("🔔", msg.replace("\n", " | "), flush=True)
-            sent_alerts.add(key)
+        if key in sent_alerts:
+            continue
+        send_telegram(msg)
+        print("🔔", msg.replace("\n", " | "))
+        sent_alerts.add(key)
 
 # ================== MAIN LOOP ==================
 def main():
     if not BETSAPI_TOKEN:
-        print("🚫 Missing BETSAPI_TOKEN env var", flush=True)
+        print("🚫 Missing BETSAPI_TOKEN env var")
         return
 
-    print("🚀 Script started successfully — waiting for first scan...", flush=True)
-    print("🔑 BETSAPI token loaded:", BETSAPI_TOKEN[:4] + "…" + BETSAPI_TOKEN[-4:], flush=True)
-    tg_targets = [x for x in [TELEGRAM_CHAT_ID_1, TELEGRAM_CHAT_ID_2] if x]
-    print("📬 Telegram targets:", tg_targets, flush=True)
+    print("🚀 Script started successfully — waiting for first scan...")
+    print(f"🔑 BETSAPI token loaded: {BETSAPI_TOKEN[:4]}…{BETSAPI_TOKEN[-4:]}")
+    print(f"📬 Telegram targets: {[c for c in [TELEGRAM_CHAT_ID_1, TELEGRAM_CHAT_ID_2] if c]}")
+
+    # Startup heartbeat
+    send_telegram("🚀 Bot started successfully — monitoring live matches")
 
     last_hb = time.time()
 
@@ -222,12 +292,12 @@ def main():
         day_mode = (9 <= now.hour < 23) or (now.hour == 23 and now.minute <= 30)
         interval = SCAN_INTERVAL_DAY if day_mode else SCAN_INTERVAL_NGT
 
-        print(f"\n🔄 Scan @ {now.strftime('%Y-%m-%d %H:%M:%S %Z')} | interval={interval}s", flush=True)
+        print(f"\n🔄 Scan @ {now.strftime('%Y-%m-%d %H:%M:%S %Z')} | interval={interval}s")
 
         try:
             res = fetch_inplay()
             evs = flatten_results(res)
-            print(f"📊 INPLAY rows: {len(evs)}", flush=True)
+            print(f"📊 INPLAY rows: {len(evs)}")
 
             for ev in evs:
                 if not isinstance(ev, dict) or ev.get("type") != "EV":
@@ -237,44 +307,44 @@ def main():
                 if not fi_id:
                     continue
 
-                home = first_nonempty(ev.get("HOME"), ev.get("T1"))
-                away = first_nonempty(ev.get("AWAY"), ev.get("T2"))
-                minute = parse_minute(first_nonempty(ev.get("TM"), ev.get("time")))
-                country = first_nonempty(ev.get("CN"))
-                league = first_nonempty(ev.get("CL"))
+                home = first_nonempty(ev.get("HOME"), ev.get("home"), ev.get("T1"), "Home")
+                away = first_nonempty(ev.get("AWAY"), ev.get("away"), ev.get("T2"), "Away")
+                score = first_nonempty(ev.get("SS"), ev.get("ss"), "?-?")
+                minute = parse_minute(first_nonempty(ev.get("TM"), ev.get("time"), ev.get("timer")))
+                country = first_nonempty(ev.get("CN"), ev.get("cc"), "—")
+                league  = first_nonempty(ev.get("CL"), ev.get("league"), ev.get("LG"), "—")
 
+                # Respect minute cutoff
                 if minute > MAX_MINUTE:
                     continue
 
-                header = match_header(country, league, home, away)
-                # short per-fixture log line so נראה תזוזה בלוגים
-                print(f"   · {country or '—'} — {league or '—'}, {minute}' | {home or 'Home'} vs {away or 'Away'} | FI={fi_id}", flush=True)
+                # Pretty match header (includes country & competition)
+                header = f"{country} — {league}, {minute}'\n{home} vs {away} | score {score}"
 
                 details = fetch_event_stats(fi_id)
                 if not details:
                     continue
 
-                # details can be list or dict; try common shapes
-                stats_payload = None
+                # details could be list or dict; normalize to stats payload
                 if isinstance(details, list):
-                    if len(details) > 0 and isinstance(details[0], dict) and "stats" in details[0]:
-                        stats_payload = details[0]["stats"]
-                    else:
-                        stats_payload = details
+                    payload = details[0].get("stats") if details and isinstance(details[0], dict) and "stats" in details[0] else details
                 elif isinstance(details, dict):
-                    stats_payload = details.get("stats") or details
+                    payload = details.get("stats") or details
+                else:
+                    continue
 
-                H, A = extract_team_stats(stats_payload)
-                if not H or not A:
+                H, A = extract_team_stats(payload)
+                if H is None or A is None:
                     continue
 
                 check_and_alert(ev, minute, header, fi_id, H, A)
 
         except Exception as e:
-            print("❌ Exception:", e, flush=True)
+            print("❌ Scan exception:", e)
 
+        # Heartbeat every 10 hours
         if time.time() - last_hb >= HEARTBEAT_SEC:
-            send_telegram("✅ Heartbeat — bot is running")
+            send_telegram("✅ Heartbeat — bot is running normally")
             last_hb = time.time()
 
         time.sleep(interval)
