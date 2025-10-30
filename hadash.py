@@ -5,7 +5,7 @@ import requests
 from datetime import datetime
 import pytz
 
-# ================== ENV VARS (no secrets in code) ==================
+# ================== ENV VARS ==================
 BETSAPI_TOKEN      = os.getenv("BETSAPI_TOKEN", "").strip()
 
 TELEGRAM_TOKEN_1   = os.getenv("TELEGRAM_TOKEN_1", "").strip()
@@ -21,8 +21,8 @@ TIMEOUT            = 20
 
 SCAN_INTERVAL_DAY  = 30        # seconds (09:00–23:30)
 SCAN_INTERVAL_NGT  = 480       # seconds (23:31–08:59)
-MAX_MINUTE         = 65        # ignore matches after this minute
-HEARTBEAT_SEC      = 10 * 60 * 60  # 10h
+MAX_MINUTE         = 65
+HEARTBEAT_SEC      = 10 * 60 * 60  # every 10h
 
 # Alert thresholds
 SOT_MIN            = 6
@@ -31,7 +31,6 @@ CORNERS_MIN        = 8
 XG_MIN             = 1.0
 KPASS_MIN          = 6
 
-# Keep memory of sent alerts to avoid duplicates
 sent_alerts = set()
 
 # ================== TELEGRAM ==================
@@ -56,28 +55,18 @@ def send_telegram(text: str):
 
 # ================== HELPERS ==================
 def parse_minute(val) -> int:
-    """extract minute from strings like '45', '45+2', '90+3', or plain int/None."""
-    if val is None:
-        return 0
-    if isinstance(val, int):
-        return val
+    if val is None: return 0
     s = str(val)
     m = re.match(r"^\s*(\d+)", s)
     return int(m.group(1)) if m else 0
 
 def to_int(x, default=0):
-    try:
-        v = int(float(x))
-        return v
-    except Exception:
-        return default
+    try: return int(float(x))
+    except: return default
 
 def to_float(x, default=0.0):
-    try:
-        v = float(x)
-        return v
-    except Exception:
-        return default
+    try: return float(x)
+    except: return default
 
 def first_nonempty(*vals):
     for v in vals:
@@ -86,21 +75,14 @@ def first_nonempty(*vals):
     return None
 
 def match_header(country, league, home, away):
-    cn = country or "—"
-    lg = league or "—"
-    h  = home or "Home"
-    a  = away or "Away"
-    return f"{cn} — {lg}\n{h} vs {a}"
+    return f"{country or '—'} — {league or '—'}\n{home or 'Home'} vs {away or 'Away'}"
 
 def flatten_results(results):
-    """results from /bet365/inplay are usually nested: [ [EV,...], [ ... ] ]"""
     out = []
     if isinstance(results, list):
         for block in results:
-            if isinstance(block, list):
-                out.extend(block)
-            elif isinstance(block, dict):
-                out.append(block)
+            if isinstance(block, list): out.extend(block)
+            elif isinstance(block, dict): out.append(block)
     elif isinstance(results, dict):
         out.append(results)
     return out
@@ -116,7 +98,6 @@ def fetch_inplay():
     return []
 
 def fetch_event_stats(fi_id: str):
-    # According to support, using FI=<EV_ID> works for stats
     url = f"{BET_BASE}/event"
     params = {"FI": fi_id, "stats": 1, "token": BETSAPI_TOKEN}
     r = requests.get(url, params=params, timeout=TIMEOUT)
@@ -126,10 +107,6 @@ def fetch_event_stats(fi_id: str):
     return None
 
 def extract_team_stats(stats_payload):
-    """
-    Try to normalize team stats. Many accounts return stats as a list [home, away]
-    with keys like S1,S2,...; sometimes nested under 'stats'.
-    """
     if isinstance(stats_payload, list) and len(stats_payload) >= 2:
         home, away = stats_payload[0], stats_payload[1]
     elif isinstance(stats_payload, dict) and "stats" in stats_payload:
@@ -141,122 +118,83 @@ def extract_team_stats(stats_payload):
     else:
         return None, None
 
-    # numeric getters for multiple possible keys
-    def get_corners(d):
-        # common guesses seen in the wild
-        for k in ("S10", "S11", "CO", "Corners", "corners", "C"):
-            if k in d:
-                return to_int(d.get(k, 0), 0)
-        return 0
+    def get_val(d, keys, conv=to_int, default=0):
+        for k in keys:
+            if k in d: return conv(d.get(k, default))
+        return default
 
-    def get_keypasses(d):
-        for k in ("KP", "KeyPasses", "key_passes", "keypasses"):
-            if k in d:
-                return to_int(d.get(k, 0), 0)
-        return 0
-
-    def get_yellows(d):
-        for k in ("YC", "Y", "Yellow", "yellow_cards", "yellow"):
-            if k in d:
-                return to_int(d.get(k, 0), 0)
-        return 0
-
-    def has_red(d):
-        for k in ("RC", "R", "red", "red_cards"):
-            if k in d:
-                return to_int(d.get(k, 0), 0) >= 1 or str(d.get(k, "0")) == "1"
-        return False
-
-    def get_xg(d):
-        for k in ("XG", "xg"):
-            if k in d and d.get(k) not in ("", None):
-                return to_float(d.get(k), 0.0)
-        return 0.0
-
-    # build normalized dicts
     H = {
-        "sot":      to_int(home.get("S1", 0), 0),
-        "shots":    to_int(home.get("S1", 0), 0) + to_int(home.get("S2", 0), 0),
-        "corners":  get_corners(home),
-        "xg":       get_xg(home),
-        "kpass":    get_keypasses(home),
-        "yellows":  get_yellows(home),
-        "has_red":  has_red(home),
-        "goals":    to_int(home.get("SC", 0), 0),
-        "team_id":  first_nonempty(home.get("TD"), home.get("team_id"), "Home"),
+        "sot":      get_val(home, ["S1"]),
+        "shots":    get_val(home, ["S1"]) + get_val(home, ["S2"]),
+        "corners":  get_val(home, ["S10", "S11", "Corners"], default=0),
+        "xg":       get_val(home, ["XG", "xg"], conv=to_float, default=0.0),
+        "kpass":    get_val(home, ["KP", "KeyPasses"], default=0),
+        "yellows":  get_val(home, ["YC", "Y"], default=0),
+        "has_red":  get_val(home, ["RC", "R"], default=0) > 0,
+        "goals":    get_val(home, ["SC"], default=0),
     }
     A = {
-        "sot":      to_int(away.get("S1", 0), 0),
-        "shots":    to_int(away.get("S1", 0), 0) + to_int(away.get("S2", 0), 0),
-        "corners":  get_corners(away),
-        "xg":       get_xg(away),
-        "kpass":    get_keypasses(away),
-        "yellows":  get_yellows(away),
-        "has_red":  has_red(away),
-        "goals":    to_int(away.get("SC", 0), 0),
-        "team_id":  first_nonempty(away.get("TD"), away.get("team_id"), "Away"),
+        "sot":      get_val(away, ["S1"]),
+        "shots":    get_val(away, ["S1"]) + get_val(away, ["S2"]),
+        "corners":  get_val(away, ["S10", "S11", "Corners"], default=0),
+        "xg":       get_val(away, ["XG", "xg"], conv=to_float, default=0.0),
+        "kpass":    get_val(away, ["KP", "KeyPasses"], default=0),
+        "yellows":  get_val(away, ["YC", "Y"], default=0),
+        "has_red":  get_val(away, ["RC", "R"], default=0) > 0,
+        "goals":    get_val(away, ["SC"], default=0),
     }
     return H, A
 
-def check_and_alert(ev: dict, minute: int, header_line: str, fi_id: str, H: dict, A: dict):
-    """emit alerts per your rules and avoid duplicates via sent_alerts set."""
+def check_and_alert(ev, minute, header, fi_id, H, A):
     alerts = []
 
-    # 6+ SOT without goal
-    if H["sot"] >= SOT_MIN and H["goals"] == 0:
-        alerts.append(("sot6_home", f"🎯 {header_line}\nHome: {H['sot']} shots on target, no goals."))
-    if A["sot"] >= SOT_MIN and A["goals"] == 0:
-        alerts.append(("sot6_away", f"🎯 {header_line}\nAway: {A['sot']} shots on target, no goals."))
+    if H["sot"] >= 6 and H["goals"] == 0:
+        alerts.append(("sot_home", f"🎯 {header}\nHome 6+ shots on target, no goals."))
+    if A["sot"] >= 6 and A["goals"] == 0:
+        alerts.append(("sot_away", f"🎯 {header}\nAway 6+ shots on target, no goals."))
 
-    # 12+ total shots without goal
-    if H["shots"] >= SHOTS_MIN and H["goals"] == 0:
-        alerts.append(("shots12_home", f"🔥 {header_line}\nHome: {H['shots']} total shots, no goals."))
-    if A["shots"] >= SHOTS_MIN and A["goals"] == 0:
-        alerts.append(("shots12_away", f"🔥 {header_line}\nAway: {A['shots']} total shots, no goals."))
+    if H["shots"] >= 12 and H["goals"] == 0:
+        alerts.append(("shots_home", f"🔥 {header}\nHome 12+ total shots, no goals."))
+    if A["shots"] >= 12 and A["goals"] == 0:
+        alerts.append(("shots_away", f"🔥 {header}\nAway 12+ total shots, no goals."))
 
-    # 8+ corners without goal
-    if H["corners"] >= CORNERS_MIN and H["goals"] == 0:
-        alerts.append(("corners8_home", f"🏁 {header_line}\nHome: {H['corners']} corners, no goals."))
-    if A["corners"] >= CORNERS_MIN and A["goals"] == 0:
-        alerts.append(("corners8_away", f"🏁 {header_line}\nAway: {A['corners']} corners, no goals."))
+    if H["corners"] >= 8 and H["goals"] == 0:
+        alerts.append(("corners_home", f"🏁 {header}\nHome 8+ corners, no goals."))
+    if A["corners"] >= 8 and A["goals"] == 0:
+        alerts.append(("corners_away", f"🏁 {header}\nAway 8+ corners, no goals."))
 
-    # xG ≥ 1.0 without goal
-    if H["xg"] >= XG_MIN and H["goals"] == 0:
-        alerts.append(("xg1_home", f"📊 {header_line}\nHome xG={H['xg']:.2f}, no goals."))
-    if A["xg"] >= XG_MIN and A["goals"] == 0:
-        alerts.append(("xg1_away", f"📊 {header_line}\nAway xG={A['xg']:.2f}, no goals."))
+    if H["xg"] >= 1.0 and H["goals"] == 0:
+        alerts.append(("xg_home", f"📊 {header}\nHome xG≥1.0, no goals."))
+    if A["xg"] >= 1.0 and A["goals"] == 0:
+        alerts.append(("xg_away", f"📊 {header}\nAway xG≥1.0, no goals."))
 
-    # 6+ key passes without goal
-    if H["kpass"] >= KPASS_MIN and H["goals"] == 0:
-        alerts.append(("kpass6_home", f"🎯 {header_line}\nHome: {H['kpass']} key passes, no goals."))
-    if A["kpass"] >= KPASS_MIN and A["goals"] == 0:
-        alerts.append(("kpass6_away", f"🎯 {header_line}\nAway: {A['kpass']} key passes, no goals."))
+    if H["kpass"] >= 6 and H["goals"] == 0:
+        alerts.append(("kpass_home", f"🎯 {header}\nHome 6+ key passes, no goals."))
+    if A["kpass"] >= 6 and A["goals"] == 0:
+        alerts.append(("kpass_away", f"🎯 {header}\nAway 6+ key passes, no goals."))
 
-    # Red card (any side)
     if H["has_red"]:
-        alerts.append(("red_home", f"🟥 {header_line}\nRed card for Home."))
+        alerts.append(("red_home", f"🟥 {header}\nRed card for Home."))
     if A["has_red"]:
-        alerts.append(("red_away", f"🟥 {header_line}\nRed card for Away."))
+        alerts.append(("red_away", f"🟥 {header}\nRed card for Away."))
 
-    # Halftime no yellows
     if minute == 45 and (H["yellows"] + A["yellows"] == 0):
-        alerts.append(("ht_no_yellows", f"⚠️ {header_line}\n45': No yellow cards so far."))
+        alerts.append(("no_yellows", f"⚠️ {header}\n45': No yellow cards so far."))
 
-    # Emit (dedup per-fixture+type)
     for tag, msg in alerts:
         key = f"{fi_id}:{tag}"
-        if key in sent_alerts:
-            continue
-        send_telegram(msg)
-        print("🔔", msg.replace("\n", " | "))
-        sent_alerts.add(key)
+        if key not in sent_alerts:
+            send_telegram(msg)
+            print("🔔", msg.replace("\n", " | "))
+            sent_alerts.add(key)
 
 # ================== MAIN LOOP ==================
 def main():
     if not BETSAPI_TOKEN:
-        print("🚫 Missing BETSAPI_TOKEN env var"); return
+        print("🚫 Missing BETSAPI_TOKEN env var")
+        return
 
-    print("🔑 Using BetsAPI token:", BETSAPI_TOKEN[:4] + "…" + BETSAPI_TOKEN[-4:])
+    print("🚀 Script started successfully — waiting for first scan...")
     last_hb = time.time()
 
     while True:
@@ -279,27 +217,23 @@ def main():
                 if not fi_id:
                     continue
 
-                # Names + meta
-                home = first_nonempty(ev.get("HOME"), ev.get("home"), ev.get("T1"))
-                away = first_nonempty(ev.get("AWAY"), ev.get("away"), ev.get("T2"))
-                score = first_nonempty(ev.get("SS"), ev.get("ss")) or "?-?"
-                minute = parse_minute(first_nonempty(ev.get("TM"), ev.get("time"), ev.get("timer")))
-                country = first_nonempty(ev.get("CN"), ev.get("cc"))
-                league  = first_nonempty(ev.get("CL"), ev.get("league"), ev.get("LG"))
+                home = first_nonempty(ev.get("HOME"), ev.get("T1"))
+                away = first_nonempty(ev.get("AWAY"), ev.get("T2"))
+                score = first_nonempty(ev.get("SS")) or "?-?"
+                minute = parse_minute(first_nonempty(ev.get("TM"), ev.get("time")))
+                country = first_nonempty(ev.get("CN"))
+                league = first_nonempty(ev.get("CL"))
 
                 if minute > MAX_MINUTE:
                     continue
 
                 header = match_header(country, league, home, away)
-
                 details = fetch_event_stats(fi_id)
                 if not details:
                     continue
 
-                # details can be list or dict; try common shapes
                 stats_payload = None
                 if isinstance(details, list):
-                    # Sometimes the first item contains 'stats', sometimes list IS the stats
                     if len(details) > 0 and isinstance(details[0], dict) and "stats" in details[0]:
                         stats_payload = details[0]["stats"]
                     else:
@@ -308,15 +242,14 @@ def main():
                     stats_payload = details.get("stats") or details
 
                 H, A = extract_team_stats(stats_payload)
-                if H is None or A is None:
+                if not H or not A:
                     continue
 
                 check_and_alert(ev, minute, header, fi_id, H, A)
 
         except Exception as e:
-            print("❌ Scan exception:", e)
+            print("❌ Exception:", e)
 
-        # Heartbeat every 10h
         if time.time() - last_hb >= HEARTBEAT_SEC:
             send_telegram("✅ Heartbeat — bot is running")
             last_hb = time.time()
