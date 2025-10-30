@@ -5,71 +5,62 @@ import requests
 from datetime import datetime
 import pytz
 
-# ================== ENV VARS ==================
-BETSAPI_TOKEN      = os.getenv("BETSAPI_TOKEN", "").strip()
-
-TELEGRAM_TOKEN_1   = os.getenv("TELEGRAM_TOKEN_1", "").strip()
+# ========== ENV VARS ==========
+BETSAPI_TOKEN = os.getenv("BETSAPI_TOKEN", "").strip()
+TELEGRAM_TOKEN_1 = os.getenv("TELEGRAM_TOKEN_1", "").strip()
 TELEGRAM_CHAT_ID_1 = os.getenv("TELEGRAM_CHAT_ID_1", "").strip()
-
-TELEGRAM_TOKEN_2   = os.getenv("TELEGRAM_TOKEN_2", "").strip()
+TELEGRAM_TOKEN_2 = os.getenv("TELEGRAM_TOKEN_2", "").strip()
 TELEGRAM_CHAT_ID_2 = os.getenv("TELEGRAM_CHAT_ID_2", "").strip()
 
-# ================== CONFIG ==================
-TZ                 = pytz.timezone("Asia/Jerusalem")
-BET_BASE           = "https://api.betsapi.com/v1/bet365"
-TIMEOUT            = 20
+# ========== CONFIG ==========
+TZ = pytz.timezone("Asia/Jerusalem")
+BET_BASE = "https://api.betsapi.com/v1/bet365"
+TIMEOUT = 20
+SCAN_INTERVAL_DAY = 30
+SCAN_INTERVAL_NGT = 480
+MAX_MINUTE = 65
+HEARTBEAT_SEC = 10 * 60 * 60
 
-# סריקות: 09:00–23:30 כל 30 שניות; 23:31–09:00 כל 8 דקות
-SCAN_INTERVAL_DAY  = 30
-SCAN_INTERVAL_NGT  = 480
+# Alert thresholds
+SOT_MIN = 6
+SHOTS_MIN = 12
+CORNERS_MIN = 8
+XG_MIN = 1.0
+KPASS_MIN = 6
 
-MAX_MINUTE         = 65          # לא סורקים/מתריעים אחרי דקה 65
-HEARTBEAT_SEC      = 10 * 60 * 60  # כל 10 שעות
+# Filter lists
+EXCLUDE_WORDS = [
+    "eSoccer", "Virtual", "Simulated", "FIFA", "Rocket League",
+    "CS:", "Dota", "Valorant", "NBA", "Basketball", "Tennis", "Ping Pong"
+]
 
-# ספי התראות
-SOT_MIN            = 6
-SHOTS_MIN          = 12
-CORNERS_MIN        = 8
-XG_MIN             = 1.0
-KPASS_MIN          = 6
-
-# למניעת כפילויות
 sent_alerts = set()
 
-# ================== TELEGRAM ==================
+# ========== TELEGRAM ==========
 def send_telegram(text: str):
     targets = []
     if TELEGRAM_TOKEN_1 and TELEGRAM_CHAT_ID_1:
         targets.append((TELEGRAM_TOKEN_1, TELEGRAM_CHAT_ID_1))
     if TELEGRAM_TOKEN_2 and TELEGRAM_CHAT_ID_2:
         targets.append((TELEGRAM_TOKEN_2, TELEGRAM_CHAT_ID_2))
-
-    if not targets:
-        print("⚠️ No Telegram targets configured")
-        return
-
     for token, chat_id in targets:
         try:
-            r = requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                data={"chat_id": chat_id, "text": text},
-                timeout=10
-            )
-            if r.status_code != 200:
-                print(f"⚠️ Telegram {chat_id} error {r.status_code}: {r.text[:180]}")
-            else:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            data = {"chat_id": chat_id, "text": text}
+            r = requests.post(url, data=data, timeout=10)
+            if r.status_code == 200:
                 print(f"✅ Telegram sent to {chat_id}")
+            else:
+                print(f"⚠️ Telegram error {r.status_code}: {r.text[:100]}")
         except Exception as e:
             print("⚠️ Telegram exception:", e)
 
-# ================== HELPERS ==================
-def parse_minute(val) -> int:
-    """מוציא דקה מתוך '45', '45+2', int, או None."""
+# ========== HELPERS ==========
+def parse_minute(val):
     if val is None:
         return 0
-    if isinstance(val, int):
-        return val
-    m = re.match(r"^\s*(\d+)", str(val))
+    s = str(val)
+    m = re.match(r"^(\d+)", s)
     return int(m.group(1)) if m else 0
 
 def to_int(x, default=0):
@@ -90,15 +81,7 @@ def first_nonempty(*vals):
             return v
     return None
 
-def match_header(country, league, home, away):
-    cn = country or "—"
-    lg = league or "—"
-    h  = home or "Home"
-    a  = away or "Away"
-    return f"{cn} — {lg}\n{h} vs {a}"
-
 def flatten_results(results):
-    """results מ-/bet365/inplay מגיעים בד״כ כמקטעים מקוננים."""
     out = []
     if isinstance(results, list):
         for block in results:
@@ -110,41 +93,33 @@ def flatten_results(results):
         out.append(results)
     return out
 
+def match_header(country, league, home, away):
+    return f"{country or '—'} — {league or '—'}\n{home or 'Home'} vs {away or 'Away'}"
+
+# ========== FETCH ==========
 def fetch_inplay():
     url = f"{BET_BASE}/inplay"
     params = {"sport_id": 1, "token": BETSAPI_TOKEN}
     r = requests.get(url, params=params, timeout=TIMEOUT)
-    try:
-        js = r.json()
-    except Exception:
-        print(f"❌ inplay non-JSON (status={r.status_code})")
-        return []
+    js = r.json()
     if js.get("success") == 1:
         return js.get("results", [])
     print("⚠️ inplay error:", js)
     return []
 
 def fetch_event_stats(fi_id: str):
-    """על פי התמיכה: stats נגיש דרך FI=<EV_ID>"""
     url = f"{BET_BASE}/event"
     params = {"FI": fi_id, "stats": 1, "token": BETSAPI_TOKEN}
     r = requests.get(url, params=params, timeout=TIMEOUT)
-    try:
-        js = r.json()
-    except Exception:
-        print(f"❌ event non-JSON for FI={fi_id} (status={r.status_code})")
-        return None
+    js = r.json()
     if js.get("success") == 1:
         return js.get("results")
-    # רק לוג, לא עוצרים את הלופ
-    print(f"⚠️ event error for FI={fi_id}:", js)
+    else:
+        print(f"⚠️ event error for FI={fi_id}: {js}")
     return None
 
+# ========== STAT EXTRACTION ==========
 def extract_team_stats(stats_payload):
-    """
-    מנרמל מבנה סטטיסטיקות: בד״כ [home, away] עם מפתחות כמו S1,S2,..., XG, SC וכו׳.
-    מחזיר שני dict-ים: H ו-A (או (None,None) אם נכשל).
-    """
     if isinstance(stats_payload, list) and len(stats_payload) >= 2:
         home, away = stats_payload[0], stats_payload[1]
     elif isinstance(stats_payload, dict) and "stats" in stats_payload:
@@ -156,124 +131,89 @@ def extract_team_stats(stats_payload):
     else:
         return None, None
 
-    def get_corners(d):
-        # לרוב S10 מייצג קרנות, אבל נשאיר fallback-ים אם ישתנה בעתיד
-        for k in ("S10", "CO", "Corners", "corners"):
-            if k in d and str(d.get(k)) != "":
-                return to_int(d.get(k), 0)
-        return 0
-
-    def get_keypasses(d):
-        for k in ("KeyPasses", "key_passes", "KP"):
-            if k in d and str(d.get(k)) != "":
-                return to_int(d.get(k), 0)
-        return 0
-
-    def get_yellows(d):
-        for k in ("Y", "yellow", "YC"):
-            if k in d and str(d.get(k)) != "":
-                return to_int(d.get(k), 0)
-        return 0
-
-    def has_red(d):
-        for k in ("R", "red", "RC"):
-            if k in d and str(d.get(k)) != "":
-                return to_int(d.get(k), 0) >= 1
-        return False
-
-    def get_xg(d):
-        for k in ("XG", "xg"):
-            if k in d and d.get(k) not in ("", None):
-                return to_float(d.get(k), 0.0)
-        return 0.0
+    def get_xg(d): return to_float(d.get("XG", 0.0))
+    def get_yellow(d): return to_int(d.get("YC", 0))
+    def has_red(d): return to_int(d.get("RC", 0)) >= 1
+    def get_kp(d): return to_int(d.get("KP", 0))
+    def get_corners(d): return to_int(d.get("S10", 0))
+    def get_sot(d): return to_int(d.get("S1", 0))
+    def get_shots(d): return get_sot(d) + to_int(d.get("S2", 0))
 
     H = {
-        "sot":      to_int(home.get("S1", 0)),                         # On Target
-        "shots":    to_int(home.get("S1", 0)) + to_int(home.get("S2", 0)),  # On+Off
-        "corners":  get_corners(home),
-        "xg":       get_xg(home),
-        "kpass":    get_keypasses(home),
-        "yellows":  get_yellows(home),
-        "has_red":  has_red(home),
-        "goals":    to_int(home.get("SC", 0)),
+        "sot": get_sot(home),
+        "shots": get_shots(home),
+        "corners": get_corners(home),
+        "xg": get_xg(home),
+        "kpass": get_kp(home),
+        "yellows": get_yellow(home),
+        "has_red": has_red(home),
+        "goals": to_int(home.get("SC", 0)),
     }
     A = {
-        "sot":      to_int(away.get("S1", 0)),
-        "shots":    to_int(away.get("S1", 0)) + to_int(away.get("S2", 0)),
-        "corners":  get_corners(away),
-        "xg":       get_xg(away),
-        "kpass":    get_keypasses(away),
-        "yellows":  get_yellows(away),
-        "has_red":  has_red(away),
-        "goals":    to_int(away.get("SC", 0)),
+        "sot": get_sot(away),
+        "shots": get_shots(away),
+        "corners": get_corners(away),
+        "xg": get_xg(away),
+        "kpass": get_kp(away),
+        "yellows": get_yellow(away),
+        "has_red": has_red(away),
+        "goals": to_int(away.get("SC", 0)),
     }
     return H, A
 
-def check_and_alert(ev: dict, minute: int, header_line: str, fi_id: str, H: dict, A: dict):
-    """שולח התראות לפי החוקים, עם מניעת כפילויות."""
+# ========== ALERTS ==========
+def check_and_alert(ev, minute, header, fi_id, H, A):
     alerts = []
 
-    # 6+ למסגרת ללא גול
     if H["sot"] >= SOT_MIN and H["goals"] == 0:
-        alerts.append(("sot6_home", f"🎯 {header_line}\nHome: {H['sot']} shots on target, 0 goals."))
+        alerts.append(("sot_home", f"🎯 {header}\nHome {H['sot']} SOT, no goals"))
     if A["sot"] >= SOT_MIN and A["goals"] == 0:
-        alerts.append(("sot6_away", f"🎯 {header_line}\nAway: {A['sot']} shots on target, 0 goals."))
+        alerts.append(("sot_away", f"🎯 {header}\nAway {A['sot']} SOT, no goals"))
 
-    # 12+ בעיטות סה״כ ללא גול
     if H["shots"] >= SHOTS_MIN and H["goals"] == 0:
-        alerts.append(("shots12_home", f"🔥 {header_line}\nHome: {H['shots']} total shots, 0 goals."))
+        alerts.append(("shots_home", f"🔥 {header}\nHome {H['shots']} shots, no goals"))
     if A["shots"] >= SHOTS_MIN and A["goals"] == 0:
-        alerts.append(("shots12_away", f"🔥 {header_line}\nAway: {A['shots']} total shots, 0 goals."))
+        alerts.append(("shots_away", f"🔥 {header}\nAway {A['shots']} shots, no goals"))
 
-    # 8+ קרנות ללא גול
     if H["corners"] >= CORNERS_MIN and H["goals"] == 0:
-        alerts.append(("corners8_home", f"🏁 {header_line}\nHome: {H['corners']} corners, 0 goals."))
+        alerts.append(("corners_home", f"🏁 {header}\nHome {H['corners']} corners, no goals"))
     if A["corners"] >= CORNERS_MIN and A["goals"] == 0:
-        alerts.append(("corners8_away", f"🏁 {header_line}\nAway: {A['corners']} corners, 0 goals."))
+        alerts.append(("corners_away", f"🏁 {header}\nAway {A['corners']} corners, no goals"))
 
-    # xG ≥ 1.0 ללא גול
     if H["xg"] >= XG_MIN and H["goals"] == 0:
-        alerts.append(("xg1_home", f"📊 {header_line}\nHome xG={H['xg']:.2f}, 0 goals."))
+        alerts.append(("xg_home", f"📊 {header}\nHome xG={H['xg']}, no goals"))
     if A["xg"] >= XG_MIN and A["goals"] == 0:
-        alerts.append(("xg1_away", f"📊 {header_line}\nAway xG={A['xg']:.2f}, 0 goals."))
+        alerts.append(("xg_away", f"📊 {header}\nAway xG={A['xg']}, no goals"))
 
-    # 6+ key passes ללא גול
     if H["kpass"] >= KPASS_MIN and H["goals"] == 0:
-        alerts.append(("kpass6_home", f"🎯 {header_line}\nHome: {H['kpass']} key passes, 0 goals."))
+        alerts.append(("kp_home", f"🎯 {header}\nHome {H['kpass']} key passes, no goals"))
     if A["kpass"] >= KPASS_MIN and A["goals"] == 0:
-        alerts.append(("kpass6_away", f"🎯 {header_line}\nAway: {A['kpass']} key passes, 0 goals."))
+        alerts.append(("kp_away", f"🎯 {header}\nAway {A['kpass']} key passes, no goals"))
 
-    # כרטיס אדום (כל צד)
     if H["has_red"]:
-        alerts.append(("red_home", f"🟥 {header_line}\nRed card for Home."))
+        alerts.append(("red_home", f"🟥 {header}\nRed card (Home)"))
     if A["has_red"]:
-        alerts.append(("red_away", f"🟥 {header_line}\nRed card for Away."))
+        alerts.append(("red_away", f"🟥 {header}\nRed card (Away)"))
 
-    # מחצית ללא צהובים
     if minute == 45 and (H["yellows"] + A["yellows"] == 0):
-        alerts.append(("ht_no_yellows", f"⚠️ {header_line}\n45': No yellow cards so far."))
+        alerts.append(("ht_noyellow", f"⚠️ {header}\n45': No yellow cards."))
 
-    # שליחה עם דה-דופליקציה
     for tag, msg in alerts:
         key = f"{fi_id}:{tag}"
-        if key in sent_alerts:
-            continue
-        send_telegram(msg)
-        print("🔔", msg.replace("\n", " | "))
-        sent_alerts.add(key)
+        if key not in sent_alerts:
+            send_telegram(msg)
+            print("🔔", msg.replace("\n", " | "))
+            sent_alerts.add(key)
 
-# ================== MAIN LOOP ==================
+# ========== MAIN ==========
 def main():
     if not BETSAPI_TOKEN:
-        print("🚫 Missing BETSAPI_TOKEN env var")
+        print("🚫 Missing BETSAPI_TOKEN")
         return
 
-    print("🚀 Script started successfully — waiting for first scan...")
-    print("🔑 BETSAPI token loaded:", BETSAPI_TOKEN[:4] + "…" + BETSAPI_TOKEN[-4:])
-    tg_targets = [t for t in [TELEGRAM_CHAT_ID_1, TELEGRAM_CHAT_ID_2] if t]
-    print("📬 Telegram targets:", tg_targets)
-    send_telegram("✅ Bot started — monitoring live matches.")
-
+    print(f"🔑 BETSAPI token loaded: {BETSAPI_TOKEN[:4]}…{BETSAPI_TOKEN[-4:]}")
+    print(f"📬 Telegram targets: {[TELEGRAM_CHAT_ID_1, TELEGRAM_CHAT_ID_2]}")
+    send_telegram("✅ Football monitor started successfully")
     last_hb = time.time()
 
     while True:
@@ -286,68 +226,48 @@ def main():
         try:
             res = fetch_inplay()
             evs = flatten_results(res)
-            print(f"📊 INPLAY rows (raw): {len(evs)}")
+            if not evs:
+                print("ℹ️ No matches in play.")
+                time.sleep(interval)
+                continue
 
-            if len(evs) == 0:
-                print("ℹ️ No in-play data from API at this moment.")
-
-            eligible = 0
-            processed = 0
-
+            filtered = []
             for ev in evs:
-                if not isinstance(ev, dict) or ev.get("type") != "EV":
+                if ev.get("type") != "EV":
                     continue
-
-                processed += 1
-
-                fi_id = ev.get("ID") or ev.get("FI")
-                if not fi_id:
+                name = (ev.get("NA") or "").lower()
+                if any(w.lower() in name for w in EXCLUDE_WORDS):
                     continue
+                filtered.append(ev)
 
-                # שמות/פרטים
-                home = first_nonempty(ev.get("HOME"), ev.get("home"), ev.get("T1"), "Home")
-                away = first_nonempty(ev.get("AWAY"), ev.get("away"), ev.get("T2"), "Away")
-                country = first_nonempty(ev.get("CN"), ev.get("cc"))
-                league  = first_nonempty(ev.get("CT"), ev.get("league"), ev.get("LG"))
+            print(f"📊 {len(filtered)} real football matches after filtering.")
 
-                minute = parse_minute(first_nonempty(ev.get("TM"), ev.get("time"), ev.get("timer")))
+            for ev in filtered:
+                fi_id = ev.get("ID")
+                minute = parse_minute(ev.get("TM"))
                 if minute > MAX_MINUTE:
                     continue
 
-                eligible += 1
-                print(f"   · {country or '—'} — {league or '—'}, {minute}' | {home} vs {away} | FI={fi_id}")
-
-                details = fetch_event_stats(fi_id)
-                if not details:
-                    continue
-
-                # details יכול להיות list או dict
-                stats_payload = None
-                if isinstance(details, list):
-                    if len(details) > 0 and isinstance(details[0], dict) and "stats" in details[0]:
-                        stats_payload = details[0]["stats"]
-                    else:
-                        stats_payload = details
-                elif isinstance(details, dict):
-                    stats_payload = details.get("stats") or details
-
-                H, A = extract_team_stats(stats_payload)
-                if H is None or A is None:
-                    continue
-
+                home = ev.get("T1")
+                away = ev.get("T2")
+                league = ev.get("CT")
+                country = ev.get("CB")
                 header = match_header(country, league, home, away)
-                check_and_alert(ev, minute, header, fi_id, H, A)
+                print(f"⚽ {header} | {minute}'")
 
-            print(f"🧾 Processed EV nodes: {processed} | Eligible (≤{MAX_MINUTE}'): {eligible}")
-            if processed > 0 and eligible == 0:
-                print("ℹ️ There are in-play matches, but none eligible (minute > limit or missing stats).")
+                stats = fetch_event_stats(fi_id)
+                if not stats:
+                    continue
+
+                H, A = extract_team_stats(stats)
+                if H and A:
+                    check_and_alert(ev, minute, header, fi_id, H, A)
 
         except Exception as e:
-            print("❌ Scan exception:", e)
+            print("❌ Exception:", e)
 
-        # Heartbeat
         if time.time() - last_hb >= HEARTBEAT_SEC:
-            send_telegram("💓 Heartbeat — bot is running")
+            send_telegram("💓 Heartbeat — bot running OK")
             last_hb = time.time()
 
         time.sleep(interval)
